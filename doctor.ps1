@@ -31,6 +31,8 @@ if (Test-Path -LiteralPath $Py -PathType Leaf) {
     & $Py -c @'
 from importlib.metadata import version, PackageNotFoundError
 
+required = {"unsloth", "unsloth-zoo", "torch"}
+failed = False
 for p in (
     "unsloth", "unsloth-zoo", "torch", "torchvision", "torchaudio", "xformers",
 ):
@@ -38,7 +40,14 @@ for p in (
         print(f"{p:14} {version(p)}")
     except PackageNotFoundError:
         print(f"{p:14} MISSING")
+        if p in required:
+            failed = True
+raise SystemExit(1 if failed else 0)
 '@
+
+    if ($LASTEXITCODE -ne 0) {
+        $Issues.Add('One or more required Python packages are missing: unsloth, unsloth-zoo, or torch.')
+    }
 
     Write-Host "`n=== GPU ===" -ForegroundColor Cyan
 
@@ -112,6 +121,9 @@ sys.path.insert(0, str(backend))
 from storage.credential_secrets import has_secret
 print("Saved HF token decrypts:", has_secret("hf_token", "default"))
 '@
+    if ($LASTEXITCODE -ne 0) {
+        $Issues.Add('Could not validate the saved Hugging Face credential state.')
+    }
 
     Write-Host "`n=== MODEL FOLDERS ===" -ForegroundColor Cyan
 
@@ -131,6 +143,9 @@ try:
 finally:
     con.close()
 '@
+    if ($LASTEXITCODE -ne 0) {
+        $Issues.Add('Could not read Studio model scan folders.')
+    }
 }
 
 Write-Host "`n=== MANAGED COMPONENTS ===" -ForegroundColor Cyan
@@ -145,7 +160,7 @@ $ManagedPaths = @(
 if ($script:UnslothBasePython) {
     $ManagedPaths = @($ManagedPaths[0], $script:UnslothBasePython) + $ManagedPaths[1..($ManagedPaths.Count - 1)]
 } else {
-    $Issues.Add('Could not resolve the managed base Python 3.13 interpreter.')
+    $Issues.Add('Could not resolve a contained managed base Python 3.13 interpreter.')
 }
 
 $ManagedRows = foreach ($Path in $ManagedPaths) {
@@ -156,11 +171,19 @@ $ManagedRows = foreach ($Path in $ManagedPaths) {
 $ManagedRows | Format-Table -AutoSize
 
 Write-Host "`n=== MANAGED PROCESSES ===" -ForegroundColor Cyan
-$ManagedProcesses = @(Get-UnslothManagedProcesses -InstallationRoot $Root)
-if ($ManagedProcesses.Count -gt 0) {
-    $ManagedProcesses | Select-Object ProcessId, Name, ExecutablePath | Format-Table -AutoSize
-} else {
-    Write-Host 'None'
+$ManagedProcesses = @()
+$ProcessEnumerationSucceeded = $false
+try {
+    $ManagedProcesses = @(Get-UnslothManagedProcesses -InstallationRoot $Root)
+    $ProcessEnumerationSucceeded = $true
+    if ($ManagedProcesses.Count -gt 0) {
+        $ManagedProcesses | Select-Object ProcessId, Name, ExecutablePath | Format-Table -AutoSize
+    } else {
+        Write-Host 'None'
+    }
+} catch {
+    Write-Warning $_.Exception.Message
+    $Issues.Add('Could not enumerate managed processes through CIM/WMI.')
 }
 
 Write-Host "`n=== ISOLATION ===" -ForegroundColor Cyan
@@ -197,11 +220,29 @@ if (Test-Path -LiteralPath $UvReceipt -PathType Leaf) {
 }
 
 Write-Host "`n=== SERVER ===" -ForegroundColor Cyan
+$Health = $null
+$HealthSucceeded = $false
 try {
     $Health = Invoke-RestMethod "http://127.0.0.1:$($script:UnslothPort)/api/health" -TimeoutSec 2
-    Write-Host 'Studio server: RUNNING' -ForegroundColor Green
+    $HealthSucceeded = $true
+} catch {}
+
+if (-not $ProcessEnumerationSucceeded) {
+    if ($HealthSucceeded) {
+        Write-Host 'Studio server: UNKNOWN (health endpoint responded, process ownership unavailable)' -ForegroundColor Yellow
+    } else {
+        Write-Host 'Studio server: UNKNOWN (process ownership unavailable)' -ForegroundColor Yellow
+    }
+} elseif ($ManagedProcesses.Count -gt 0 -and $HealthSucceeded) {
+    Write-Host 'Studio server: RUNNING (managed process + health endpoint)' -ForegroundColor Green
     $Health | ConvertTo-Json -Depth 5
-} catch {
+} elseif ($ManagedProcesses.Count -gt 0 -and -not $HealthSucceeded) {
+    Write-Host 'Studio server: MANAGED PROCESS PRESENT, HEALTH CHECK FAILED' -ForegroundColor Red
+    $Issues.Add('Managed Studio process is present but the local health endpoint did not respond.')
+} elseif ($ManagedProcesses.Count -eq 0 -and $HealthSucceeded) {
+    Write-Host 'Studio server: UNMANAGED LISTENER / NOT THIS INSTALLATION' -ForegroundColor Red
+    $Issues.Add("A service responded on the configured Studio port, but no process owned by this installation was found.")
+} else {
     Write-Host 'Studio server: STOPPED' -ForegroundColor DarkGray
 }
 

@@ -1,0 +1,20 @@
+# Managed installation payload
+/runtime/
+/tools/
+/python/
+/cache/
+/logs/
+/forensic/
+/work/
+/.unsloth-operation.lock
+
+# Local configuration
+/config.psd1
+
+# Models can be enormous and must never enter Git
+/models/
+
+# Editor noise
+.vscode/
+.idea/
+*.log

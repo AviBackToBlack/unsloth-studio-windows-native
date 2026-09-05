@@ -146,7 +146,7 @@ function Assert-ManagedChildPhysicalLocation {
     if ((Test-Path -LiteralPath $root) -and (Test-Path -LiteralPath $pathNormalized)) {
         $rootFinal = Get-CanonicalExistingPath $root
         $pathFinal = Get-CanonicalExistingPath $pathNormalized
-        $expectedFinal = (Join-Path $rootFinal $RelativePath).TrimEnd('\')
+        $expectedFinal = [System.IO.Path]::Combine($rootFinal, $RelativePath).TrimEnd('\')
 
         if (-not $pathFinal.Equals($expectedFinal, [System.StringComparison]::OrdinalIgnoreCase)) {
             throw "Managed path resolves through a filesystem alias/junction outside its expected location '$expectedLexical': $pathFinal"
@@ -165,8 +165,6 @@ function Assert-SafeModelsRoot {
     $defaultModels = Get-NormalizedPath (Join-Path $root 'models')
 
     if ($models.Equals($defaultModels, [System.StringComparison]::OrdinalIgnoreCase)) {
-        # The default spelling is allowed only when it physically resolves to
-        # the real <root>\models directory, never a junction/alias elsewhere.
         Assert-ManagedChildPhysicalLocation `
             -InstallationRoot $root `
             -Path $models `
@@ -198,7 +196,7 @@ function Test-CommandLineReferencesRuntime {
     }
 
     $escaped = [regex]::Escape((Get-NormalizedPath $RuntimePath))
-    $pattern = "(?i)(?:^|[\s`\"'])$escaped(?=$|[\\/\s`\"'])"
+    $pattern = '(?i)(?:^|[\s"])' + $escaped + '(?=$|[\\/\s"])'
     return [regex]::IsMatch($CommandLine, $pattern)
 }
 

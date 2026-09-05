@@ -1,4 +1,4 @@
-﻿param(
+param(
     [Parameter(Mandatory, Position = 0)]
     [ValidatePattern('^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$')]
     [string]$RepoId,
@@ -16,6 +16,7 @@
 )
 
 $ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
 
 $Root = $PSScriptRoot
 . "$Root\scripts\env.ps1"
@@ -23,7 +24,7 @@ $Root = $PSScriptRoot
 $Py = "$Root\runtime\unsloth_studio\Scripts\python.exe"
 
 if (-not (Test-Path -LiteralPath $Py -PathType Leaf)) {
-    throw "Studio Python not found: $Py"
+    throw 'Unsloth Studio is not installed.'
 }
 
 if ($Mode -eq 'All' -and $Include.Count -gt 0) {
@@ -35,35 +36,24 @@ if ($Mode -eq 'Filtered' -and $Include.Count -eq 0) {
 }
 
 $Org, $Model = $RepoId -split '/', 2
-
-$Target =
-    Join-Path $script:UnslothModels "huggingface\$Org\$Model"
-
-$ScanRoot =
-    Split-Path $Target -Parent
+$Target = Join-Path $script:UnslothModels "huggingface\$Org\$Model"
+$ScanRoot = Split-Path $Target -Parent
 
 Write-Host "`n=== MODEL SYNC ===" -ForegroundColor Cyan
 Write-Host "Repo     : $RepoId"
 Write-Host "Revision : $Revision"
 Write-Host "Target   : $Target"
 Write-Host "Mode     : $(if ($Apply) { 'DOWNLOAD' } else { 'DRY RUN' })"
+if ($Include.Count) { Write-Host "Include  : $($Include -join ', ')" }
+if ($Exclude.Count) { Write-Host "Exclude  : $($Exclude -join ', ')" }
 
-if ($Include.Count) {
-    Write-Host "Include  : $($Include -join ', ')"
-}
-
-if ($Exclude.Count) {
-    Write-Host "Exclude  : $($Exclude -join ', ')"
-}
-
-# Pass arguments without ever putting the HF token in the environment.
-$env:_UNSLOTH_SYNC_REPO     = $RepoId
+$env:_UNSLOTH_SYNC_REPO = $RepoId
 $env:_UNSLOTH_SYNC_REVISION = $Revision
-$env:_UNSLOTH_SYNC_TARGET   = $Target
+$env:_UNSLOTH_SYNC_TARGET = $Target
 $env:_UNSLOTH_SYNC_SCANROOT = $ScanRoot
-$env:_UNSLOTH_SYNC_INCLUDE  = ConvertTo-Json -InputObject @($Include) -Compress
-$env:_UNSLOTH_SYNC_EXCLUDE  = ConvertTo-Json -InputObject @($Exclude) -Compress
-$env:_UNSLOTH_SYNC_APPLY    = if ($Apply) { '1' } else { '0' }
+$env:_UNSLOTH_SYNC_INCLUDE = ConvertTo-Json -InputObject @($Include) -Compress
+$env:_UNSLOTH_SYNC_EXCLUDE = ConvertTo-Json -InputObject @($Exclude) -Compress
+$env:_UNSLOTH_SYNC_APPLY = if ($Apply) { '1' } else { '0' }
 
 $Code = @'
 import json
@@ -73,27 +63,25 @@ from pathlib import Path
 
 from huggingface_hub import snapshot_download
 
-root = Path(r"D:\AI\Unsloth")
-
-backend = (
-    root / "runtime" / "unsloth_studio" /
-    "Lib" / "site-packages" / "studio" / "backend"
-)
+root = Path(os.environ["UNSLOTH_NATIVE_ROOT"])
+backend = root / "runtime" / "unsloth_studio" / "Lib" / "site-packages" / "studio" / "backend"
 sys.path.insert(0, str(backend))
 
 from storage.credential_secrets import get_hf_token
 
-repo_id  = os.environ["_UNSLOTH_SYNC_REPO"]
+repo_id = os.environ["_UNSLOTH_SYNC_REPO"]
 revision = os.environ["_UNSLOTH_SYNC_REVISION"]
-target   = Path(os.environ["_UNSLOTH_SYNC_TARGET"])
+target = Path(os.environ["_UNSLOTH_SYNC_TARGET"])
 scanroot = Path(os.environ["_UNSLOTH_SYNC_SCANROOT"])
-include  = json.loads(os.environ["_UNSLOTH_SYNC_INCLUDE"])
-exclude  = json.loads(os.environ["_UNSLOTH_SYNC_EXCLUDE"])
-apply    = os.environ["_UNSLOTH_SYNC_APPLY"] == "1"
+include = json.loads(os.environ["_UNSLOTH_SYNC_INCLUDE"])
+exclude = json.loads(os.environ["_UNSLOTH_SYNC_EXCLUDE"])
+apply = os.environ["_UNSLOTH_SYNC_APPLY"] == "1"
 
 token = get_hf_token()
 if not token:
-    raise SystemExit("Saved Hugging Face token is missing or cannot be decrypted.")
+    raise SystemExit(
+        "Saved Hugging Face token is missing. Sign in to Hugging Face from Unsloth Studio first."
+    )
 
 kwargs = dict(
     repo_id=repo_id,
@@ -106,33 +94,18 @@ kwargs = dict(
 
 if not apply:
     print("\n=== DRY RUN ===")
-
-    infos = snapshot_download(
-        **kwargs,
-        dry_run=True,
-    )
-
+    infos = snapshot_download(**kwargs, dry_run=True)
     total = 0
     count = 0
-
     for info in sorted(infos, key=lambda x: x.filename):
         name = info.filename
         size = int(info.file_size or 0)
-        cached = bool(info.is_cached)
         will_download = bool(info.will_download)
-
         status = "DOWNLOAD" if will_download else "PRESENT"
-
         if will_download:
             count += 1
             total += size
-
-        print(
-            f"{status:8} "
-            f"{size / 1024**3:10.3f} GiB  "
-            f"{name}"
-        )
-
+        print(f"{status:8} {size / 1024**3:10.3f} GiB  {name}")
     print()
     print(f"Files to download : {count}")
     print(f"Bytes to download : {total}")
@@ -141,38 +114,25 @@ if not apply:
     raise SystemExit(0)
 
 print("\n=== DOWNLOADING ===")
-
 result = snapshot_download(**kwargs)
-
 print("\nDownload complete:")
 print(result)
 
-# Register the namespace directory with Studio.
 from storage.studio_db import add_scan_folder_with_status
-
 folder, inserted = add_scan_folder_with_status(str(scanroot))
-
 print("\n=== STUDIO SCAN FOLDER ===")
-print("path      :", folder["path"])
-print("new       :", inserted)
+print("path :", folder["path"])
+print("new  :", inserted)
 
-# Report actual payload vs lightweight local-dir metadata.
 metadata_root = target / ".cache" / "huggingface"
-
-payload_bytes = 0
-payload_files = 0
-metadata_bytes = 0
-metadata_files = 0
-
+payload_bytes = payload_files = metadata_bytes = metadata_files = 0
 for p in target.rglob("*"):
     if not p.is_file():
         continue
-
     try:
         size = p.stat().st_size
     except OSError:
         continue
-
     try:
         p.relative_to(metadata_root)
         metadata_files += 1
@@ -188,12 +148,10 @@ print(f"Metadata : {metadata_files} files, {metadata_bytes / 1024**2:.3f} MiB")
 
 try {
     & $Py -c $Code
-
     if ($LASTEXITCODE -ne 0) {
         throw "Model sync failed with exit code $LASTEXITCODE"
     }
-}
-finally {
+} finally {
     @(
         '_UNSLOTH_SYNC_REPO'
         '_UNSLOTH_SYNC_REVISION'

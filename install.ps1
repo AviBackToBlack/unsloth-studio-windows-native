@@ -100,7 +100,11 @@ if (Test-Path -LiteralPath $ExistingConfigPath -PathType Leaf) {
 
 if ([string]::IsNullOrWhiteSpace($ModelsRoot)) {
     if ($ExistingConfig -and -not [string]::IsNullOrWhiteSpace($ExistingConfig.ModelsRoot)) {
-        $ModelsRoot = [System.IO.Path]::GetFullPath([string]$ExistingConfig.ModelsRoot)
+        $ExistingModelsRoot = [string]$ExistingConfig.ModelsRoot
+        if (-not [System.IO.Path]::IsPathRooted($ExistingModelsRoot)) {
+            throw "ModelsRoot in existing config.psd1 must be an absolute path: $ExistingModelsRoot"
+        }
+        $ModelsRoot = [System.IO.Path]::GetFullPath($ExistingModelsRoot)
     } else {
         $ModelsRoot = Join-Path $Root 'models'
     }
@@ -215,7 +219,7 @@ if (-not ($PythonResolvedFull.Equals($PythonRootExpected, [System.StringComparis
 Write-Host "`n=== INSTALL / REPAIR UNSLOTH STUDIO ===" -ForegroundColor Cyan
 $Installer = "$Root\work\unsloth-install.ps1"
 $InstallerMeta = "$Root\forensic\installer.json"
-$Response = Invoke-WebRequest -Uri 'https://unsloth.ai/install.ps1' -OutFile $Installer -UseBasicParsing
+$Response = Invoke-WebRequest -Uri 'https://unsloth.ai/install.ps1' -OutFile $Installer -UseBasicParsing -PassThru
 $InstallerHash = (Get-FileHash -LiteralPath $Installer -Algorithm SHA256).Hash
 $EffectiveUrl = $null
 try { $EffectiveUrl = $Response.BaseResponse.RequestMessage.RequestUri.AbsoluteUri } catch {}

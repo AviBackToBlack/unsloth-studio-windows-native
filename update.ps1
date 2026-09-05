@@ -1,47 +1,39 @@
-﻿$ErrorActionPreference = 'Stop'
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
 
 $Root = $PSScriptRoot
-
 . "$Root\scripts\env.ps1"
 
 $Cli = "$Root\runtime\bin\unsloth.cmd"
-$Py  = "$Root\runtime\unsloth_studio\Scripts\python.exe"
+$Py = "$Root\runtime\unsloth_studio\Scripts\python.exe"
 
-if (-not (Test-Path $Cli)) {
-    throw "Managed Unsloth CLI not found: $Cli"
+if (-not (Test-Path -LiteralPath $Cli -PathType Leaf)) {
+    throw 'Unsloth Studio is not installed.'
 }
 
-if (-not (Test-Path $Py)) {
+if (-not (Test-Path -LiteralPath $Py -PathType Leaf)) {
     throw "Managed Studio Python not found: $Py"
 }
 
-# ------------------------------------------------------------------
-# Studio must be stopped
-# ------------------------------------------------------------------
-
-if (Get-NetTCPConnection `
-        -LocalPort 8888 `
-        -State Listen `
-        -ErrorAction SilentlyContinue) {
-
-    throw 'Unsloth Studio is running on port 8888. Stop it before updating.'
+if (Get-NetTCPConnection -LocalPort $script:UnslothPort -State Listen -ErrorAction SilentlyContinue) {
+    throw "A process is listening on Studio port $script:UnslothPort. Stop Studio before updating."
 }
 
-# ------------------------------------------------------------------
-# Snapshot current state
-# ------------------------------------------------------------------
+$UserPathBefore = [Environment]::GetEnvironmentVariable('Path', 'User')
+$MachinePathBefore = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+$CMakeBefore = (Get-Command cmake.exe -CommandType Application -ErrorAction SilentlyContinue).Source
+$NvccBefore = (Get-Command nvcc.exe -CommandType Application -ErrorAction SilentlyContinue).Source
 
-$Stamp  = Get-Date -Format 'yyyyMMdd-HHmmss'
+$Stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $Backup = "$Root\forensic\updates\$Stamp"
-
 New-Item -ItemType Directory -Force $Backup | Out-Null
 
 foreach ($File in @(
     "$Root\runtime\studio.db"
     "$Root\runtime\auth\auth.db"
 )) {
-    if (Test-Path $File) {
-        Copy-Item $File $Backup
+    if (Test-Path -LiteralPath $File -PathType Leaf) {
+        Copy-Item -LiteralPath $File -Destination $Backup
     }
 }
 
@@ -57,21 +49,13 @@ for p in ("unsloth", "unsloth-zoo", "torch", "xformers"):
         print(f"{p:12} NOT INSTALLED")
 '@
 
-# ------------------------------------------------------------------
-# Official update
-# ------------------------------------------------------------------
-
-Write-Host "`n=== UNSLOTH STUDIO UPDATE ===" -ForegroundColor Cyan
+Write-Host "`n=== OFFICIAL UNSLOTH STUDIO UPDATE ===" -ForegroundColor Cyan
 
 & $Cli studio update
 
 if ($LASTEXITCODE -ne 0) {
-    throw "Unsloth Studio update failed: exit code $LASTEXITCODE"
+    throw "Unsloth Studio update failed with exit code $LASTEXITCODE"
 }
-
-# ------------------------------------------------------------------
-# Validation
-# ------------------------------------------------------------------
 
 Write-Host "`n=== AFTER ===" -ForegroundColor Cyan
 
@@ -104,35 +88,45 @@ if ($LASTEXITCODE -ne 0) {
 Write-Host "`n=== STATE ===" -ForegroundColor Cyan
 
 & $Py -c @'
+import os
 import sqlite3
 from pathlib import Path
 
-root = Path(r"D:\AI\Unsloth")
+root = Path(os.environ["UNSLOTH_NATIVE_ROOT"])
 
 for name, p in (
     ("studio", root / "runtime" / "studio.db"),
-    ("auth",   root / "runtime" / "auth" / "auth.db"),
+    ("auth", root / "runtime" / "auth" / "auth.db"),
 ):
+    if not p.exists():
+        print(name, "MISSING")
+        continue
     con = sqlite3.connect(p)
     print(name, con.execute("PRAGMA integrity_check").fetchone()[0])
     con.close()
 '@
 
-Write-Host "`n=== TOOLCHAIN LEAK CHECK ===" -ForegroundColor Cyan
+$UserPathAfter = [Environment]::GetEnvironmentVariable('Path', 'User')
+$MachinePathAfter = [Environment]::GetEnvironmentVariable('Path', 'Machine')
 
-[pscustomobject]@{
-    CMake = (
-        Get-Command cmake.exe `
-            -CommandType Application `
-            -ErrorAction SilentlyContinue
-    ).Source
+if ($UserPathAfter -cne $UserPathBefore) {
+    throw 'User PATH changed during update.'
+}
 
-    NVCC = (
-        Get-Command nvcc.exe `
-            -CommandType Application `
-            -ErrorAction SilentlyContinue
-    ).Source
-} | Format-List
+if ($MachinePathAfter -cne $MachinePathBefore) {
+    throw 'Machine PATH changed during update.'
+}
+
+$CMakeAfter = (Get-Command cmake.exe -CommandType Application -ErrorAction SilentlyContinue).Source
+$NvccAfter = (Get-Command nvcc.exe -CommandType Application -ErrorAction SilentlyContinue).Source
+
+if (-not $CMakeBefore -and $CMakeAfter) {
+    throw "Unexpected global CMake appeared during update: $CMakeAfter"
+}
+
+if (-not $NvccBefore -and $NvccAfter) {
+    throw "Unexpected global nvcc appeared during update: $NvccAfter"
+}
 
 Write-Host "Backup: $Backup" -ForegroundColor DarkGray
 Write-Host "`n=== UPDATE COMPLETE ===" -ForegroundColor Green

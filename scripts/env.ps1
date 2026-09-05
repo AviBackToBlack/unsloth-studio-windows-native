@@ -29,18 +29,35 @@ $script:UnslothPort = if ($null -ne $script:UnslothConfig.Port) {
     8888
 }
 
-$script:UnslothBindHost = if (-not [string]::IsNullOrWhiteSpace($script:UnslothConfig.BindHost)) {
-    [string]$script:UnslothConfig.BindHost
-} else {
-    '127.0.0.1'
-}
-
 if ($script:UnslothPort -lt 1 -or $script:UnslothPort -gt 65535) {
     throw "Invalid Port in config.psd1: $script:UnslothPort"
 }
 
 $script:UnslothUv = Join-Path $script:UnslothRoot 'tools\uv\uv.exe'
-$script:UnslothBasePython = Join-Path $script:UnslothRoot 'python\cpython-3.13-windows-x86_64-none\python.exe'
+$script:UnslothPythonState = Join-Path $script:UnslothRoot 'forensic\managed-python.json'
+$script:UnslothBasePython = $null
+
+if (Test-Path -LiteralPath $script:UnslothPythonState -PathType Leaf) {
+    try {
+        $pythonState = Get-Content -LiteralPath $script:UnslothPythonState -Raw | ConvertFrom-Json
+        if ($pythonState.executable) {
+            $candidate = [System.IO.Path]::GetFullPath([string]$pythonState.executable)
+            if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+                $script:UnslothBasePython = $candidate
+            }
+        }
+    } catch {}
+}
+
+if (-not $script:UnslothBasePython -and (Test-Path -LiteralPath $script:UnslothUv -PathType Leaf)) {
+    try {
+        $candidate = (& $script:UnslothUv python find --managed-python 3.13 2>$null).Trim()
+        if ($candidate -and (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+            $script:UnslothBasePython = [System.IO.Path]::GetFullPath($candidate)
+        }
+    } catch {}
+}
+
 $script:UnslothStudioPython = Join-Path $script:UnslothRoot 'runtime\unsloth_studio\Scripts\python.exe'
 
 # Unsloth
@@ -93,8 +110,11 @@ $env:PYTHONIOENCODING = 'utf-8'
 # Process-local PATH only
 $localEntries = @(
     (Join-Path $script:UnslothRoot 'tools\uv')
-    (Join-Path $script:UnslothRoot 'python\cpython-3.13-windows-x86_64-none')
 )
+
+if ($script:UnslothBasePython) {
+    $localEntries += Split-Path -Parent $script:UnslothBasePython
+}
 
 $currentEntries = @(
     $env:PATH -split ';' |

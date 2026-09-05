@@ -34,17 +34,48 @@ if ($script:UnslothPort -lt 1 -or $script:UnslothPort -gt 65535) {
 }
 
 $script:UnslothUv = Join-Path $script:UnslothRoot 'tools\uv\uv.exe'
+$script:UnslothPythonRoot = [System.IO.Path]::GetFullPath((Join-Path $script:UnslothRoot 'python')).TrimEnd('\')
 $script:UnslothPythonState = Join-Path $script:UnslothRoot 'forensic\managed-python.json'
 $script:UnslothBasePython = $null
+
+# uv containment must be established before any `uv python find` fallback.
+$env:UV_INSTALL_DIR = Join-Path $script:UnslothRoot 'tools\uv'
+$env:UV_NO_MODIFY_PATH = '1'
+$env:UV_CACHE_DIR = Join-Path $script:UnslothRoot 'cache\uv'
+$env:UV_PYTHON_INSTALL_DIR = $script:UnslothPythonRoot
+$env:UV_PYTHON_INSTALL_BIN = '0'
+$env:UV_TOOL_DIR = Join-Path $script:UnslothRoot 'tools\uv-tools'
+$env:UV_TOOL_BIN_DIR = Join-Path $script:UnslothRoot 'tools\uv-bin'
+
+function Test-ManagedPythonCandidate {
+    param([string]$Candidate)
+
+    if ([string]::IsNullOrWhiteSpace($Candidate)) {
+        return $false
+    }
+
+    try {
+        $full = [System.IO.Path]::GetFullPath($Candidate)
+    } catch {
+        return $false
+    }
+
+    if (-not (Test-Path -LiteralPath $full -PathType Leaf)) {
+        return $false
+    }
+
+    return $full.StartsWith(
+        $script:UnslothPythonRoot + '\',
+        [System.StringComparison]::OrdinalIgnoreCase
+    )
+}
 
 if (Test-Path -LiteralPath $script:UnslothPythonState -PathType Leaf) {
     try {
         $pythonState = Get-Content -LiteralPath $script:UnslothPythonState -Raw | ConvertFrom-Json
-        if ($pythonState.executable) {
-            $candidate = [System.IO.Path]::GetFullPath([string]$pythonState.executable)
-            if (Test-Path -LiteralPath $candidate -PathType Leaf) {
-                $script:UnslothBasePython = $candidate
-            }
+        $candidate = [string]$pythonState.executable
+        if (Test-ManagedPythonCandidate -Candidate $candidate) {
+            $script:UnslothBasePython = [System.IO.Path]::GetFullPath($candidate)
         }
     } catch {}
 }
@@ -52,7 +83,7 @@ if (Test-Path -LiteralPath $script:UnslothPythonState -PathType Leaf) {
 if (-not $script:UnslothBasePython -and (Test-Path -LiteralPath $script:UnslothUv -PathType Leaf)) {
     try {
         $candidate = (& $script:UnslothUv python find --managed-python 3.13 2>$null).Trim()
-        if ($candidate -and (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+        if (Test-ManagedPythonCandidate -Candidate $candidate) {
             $script:UnslothBasePython = [System.IO.Path]::GetFullPath($candidate)
         }
     } catch {}
@@ -83,15 +114,6 @@ $env:UNSLOTH_LLAMA_TAG = 'latest'
 ) | ForEach-Object {
     Remove-Item "Env:$_" -ErrorAction SilentlyContinue
 }
-
-# uv
-$env:UV_INSTALL_DIR = Join-Path $script:UnslothRoot 'tools\uv'
-$env:UV_NO_MODIFY_PATH = '1'
-$env:UV_CACHE_DIR = Join-Path $script:UnslothRoot 'cache\uv'
-$env:UV_PYTHON_INSTALL_DIR = Join-Path $script:UnslothRoot 'python'
-$env:UV_PYTHON_INSTALL_BIN = '0'
-$env:UV_TOOL_DIR = Join-Path $script:UnslothRoot 'tools\uv-tools'
-$env:UV_TOOL_BIN_DIR = Join-Path $script:UnslothRoot 'tools\uv-bin'
 
 # Python / ML caches
 $env:HF_HOME = Join-Path $script:UnslothRoot 'cache\huggingface'

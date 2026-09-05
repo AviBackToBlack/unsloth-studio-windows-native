@@ -177,7 +177,7 @@ try {
     $ManagedProcesses = @(Get-UnslothManagedProcesses -InstallationRoot $Root)
     $ProcessEnumerationSucceeded = $true
     if ($ManagedProcesses.Count -gt 0) {
-        $ManagedProcesses | Select-Object ProcessId, Name, ExecutablePath | Format-Table -AutoSize
+        $ManagedProcesses | Select-Object ProcessId, ParentProcessId, Name, ExecutablePath | Format-Table -AutoSize
     } else {
         Write-Host 'None'
     }
@@ -186,9 +186,43 @@ try {
     $Issues.Add('Could not enumerate managed processes through CIM/WMI.')
 }
 
+function Test-PersistentPathContainsRoot {
+    param([string]$PathValue)
+
+    if ([string]::IsNullOrWhiteSpace($PathValue)) {
+        return $false
+    }
+
+    foreach ($entry in ($PathValue -split ';')) {
+        $candidate = $entry.Trim().Trim('"')
+        if ([string]::IsNullOrWhiteSpace($candidate)) {
+            continue
+        }
+
+        $candidate = [Environment]::ExpandEnvironmentVariables($candidate)
+        if (-not [System.IO.Path]::IsPathFullyQualified($candidate)) {
+            continue
+        }
+
+        try {
+            if (Test-PathInsideOrEqual -Path $candidate -Parent $Root -PhysicalWhenPossible) {
+                return $true
+            }
+        } catch {
+            # Diagnostics should not turn a malformed unrelated PATH entry into
+            # an installation leak. It remains visible in the user's PATH itself.
+            continue
+        }
+    }
+
+    return $false
+}
+
 Write-Host "`n=== ISOLATION ===" -ForegroundColor Cyan
-$UserPathHasRoot = [Environment]::GetEnvironmentVariable('Path','User') -match [regex]::Escape($Root)
-$MachinePathHasRoot = [Environment]::GetEnvironmentVariable('Path','Machine') -match [regex]::Escape($Root)
+$UserPersistentPath = [Environment]::GetEnvironmentVariable('Path','User')
+$MachinePersistentPath = [Environment]::GetEnvironmentVariable('Path','Machine')
+$UserPathHasRoot = Test-PersistentPathContainsRoot $UserPersistentPath
+$MachinePathHasRoot = Test-PersistentPathContainsRoot $MachinePersistentPath
 
 [pscustomobject]@{
     UserPathHasInstallationRoot = $UserPathHasRoot
@@ -227,21 +261,52 @@ try {
     $HealthSucceeded = $true
 } catch {}
 
-if (-not $ProcessEnumerationSucceeded) {
-    if ($HealthSucceeded) {
-        Write-Host 'Studio server: UNKNOWN (health endpoint responded, process ownership unavailable)' -ForegroundColor Yellow
-    } else {
-        Write-Host 'Studio server: UNKNOWN (process ownership unavailable)' -ForegroundColor Yellow
+$ListenerEnumerationSucceeded = $false
+$Listeners = @()
+try {
+    $Listeners = @(
+        Get-NetTCPConnection -State Listen -LocalPort $script:UnslothPort -ErrorAction Stop
+    )
+    $ListenerEnumerationSucceeded = $true
+} catch {
+    # Get-NetTCPConnection throws both when the provider is unavailable and when
+    # no matching listener exists. Distinguish the ordinary no-listener case.
+    try {
+        $allListeners = @(Get-NetTCPConnection -State Listen -ErrorAction Stop)
+        $Listeners = @($allListeners | Where-Object { $_.LocalPort -eq $script:UnslothPort })
+        $ListenerEnumerationSucceeded = $true
+    } catch {
+        $Issues.Add('Could not enumerate TCP listener ownership.')
     }
-} elseif ($ManagedProcesses.Count -gt 0 -and $HealthSucceeded) {
-    Write-Host 'Studio server: RUNNING (managed process + health endpoint)' -ForegroundColor Green
+}
+
+$ManagedPids = @{}
+foreach ($process in $ManagedProcesses) {
+    $ManagedPids[[int]$process.ProcessId] = $true
+}
+$ManagedListeners = @(
+    $Listeners | Where-Object { $ManagedPids.ContainsKey([int]$_.OwningProcess) }
+)
+
+if (-not $ProcessEnumerationSucceeded -or -not $ListenerEnumerationSucceeded) {
+    if ($HealthSucceeded) {
+        Write-Host 'Studio server: UNKNOWN (health responded, ownership could not be established)' -ForegroundColor Yellow
+    } else {
+        Write-Host 'Studio server: UNKNOWN (ownership could not be established)' -ForegroundColor Yellow
+    }
+} elseif ($ManagedListeners.Count -gt 0 -and $HealthSucceeded) {
+    Write-Host 'Studio server: RUNNING (managed listener PID + health endpoint)' -ForegroundColor Green
+    $ManagedListeners | Select-Object LocalAddress, LocalPort, OwningProcess | Format-Table -AutoSize
     $Health | ConvertTo-Json -Depth 5
-} elseif ($ManagedProcesses.Count -gt 0 -and -not $HealthSucceeded) {
-    Write-Host 'Studio server: MANAGED PROCESS PRESENT, HEALTH CHECK FAILED' -ForegroundColor Red
-    $Issues.Add('Managed Studio process is present but the local health endpoint did not respond.')
-} elseif ($ManagedProcesses.Count -eq 0 -and $HealthSucceeded) {
+} elseif ($ManagedListeners.Count -gt 0 -and -not $HealthSucceeded) {
+    Write-Host 'Studio server: MANAGED LISTENER PRESENT, HEALTH CHECK FAILED' -ForegroundColor Red
+    $Issues.Add('This installation owns the configured Studio listener, but its health endpoint did not respond.')
+} elseif ($ManagedListeners.Count -eq 0 -and $HealthSucceeded) {
     Write-Host 'Studio server: UNMANAGED LISTENER / NOT THIS INSTALLATION' -ForegroundColor Red
-    $Issues.Add("A service responded on the configured Studio port, but no process owned by this installation was found.")
+    $Issues.Add('The Studio health URL responded, but the configured listener is not owned by this installation.')
+} elseif ($Listeners.Count -gt 0) {
+    Write-Host 'Studio server: PORT OWNED BY ANOTHER PROCESS' -ForegroundColor Red
+    $Issues.Add('The configured Studio port is listening, but its owning PID is not managed by this installation.')
 } else {
     Write-Host 'Studio server: STOPPED' -ForegroundColor DarkGray
 }

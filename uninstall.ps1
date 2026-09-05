@@ -6,11 +6,11 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $Root = [System.IO.Path]::GetFullPath($PSScriptRoot)
+. "$Root\scripts\common.ps1"
 . "$Root\scripts\env.ps1"
 
-if (Get-NetTCPConnection -LocalPort $script:UnslothPort -State Listen -ErrorAction SilentlyContinue) {
-    throw "A process is listening on Studio port $script:UnslothPort. Stop Studio before uninstalling."
-}
+Assert-UnslothStopped -InstallationRoot $Root
+Assert-SafeModelsRoot -InstallationRoot $Root -ModelsRoot $script:UnslothModels
 
 Write-Host "`nUnsloth Studio native installation" -ForegroundColor Cyan
 Write-Host "Root   : $Root"
@@ -19,6 +19,10 @@ Write-Host ''
 Write-Host 'Repository scripts and LICENSE will be kept.'
 Write-Host 'External model libraries are never deleted.'
 
+$DefaultModels = Get-NormalizedPath (Join-Path $Root 'models')
+$ActualModels = Get-NormalizedPath $script:UnslothModels
+
+# Validate every removal target before deleting anything.
 $OwnedPaths = @(
     "$Root\runtime"
     "$Root\tools"
@@ -29,32 +33,24 @@ $OwnedPaths = @(
     "$Root\forensic"
 )
 
-foreach ($Path in $OwnedPaths) {
-    if ((Test-Path -LiteralPath $Path) -and $PSCmdlet.ShouldProcess($Path, 'Remove managed installation data')) {
-        Remove-Item -LiteralPath $Path -Recurse -Force
+foreach ($Owned in $OwnedPaths) {
+    if (Test-PathInsideOrEqual -Path $ActualModels -Parent $Owned) {
+        throw "Refusing uninstall because ModelsRoot overlaps managed path '$Owned': $ActualModels"
     }
 }
 
-$DefaultModels = [System.IO.Path]::GetFullPath("$Root\models")
-$ActualModels = [System.IO.Path]::GetFullPath($script:UnslothModels)
-
-if ($RemoveModels) {
-    if (-not $ActualModels.Equals($DefaultModels, [System.StringComparison]::OrdinalIgnoreCase)) {
-        Write-Warning "ModelsRoot is external and will NOT be deleted: $ActualModels"
-    } elseif ((Test-Path -LiteralPath $DefaultModels) -and $PSCmdlet.ShouldProcess($DefaultModels, 'Remove local models')) {
-        Remove-Item -LiteralPath $DefaultModels -Recurse -Force
-    }
-} elseif (Test-Path -LiteralPath $ActualModels) {
-    Write-Host "Models preserved: $ActualModels" -ForegroundColor Yellow
-}
-
+# Remove the uv receipt while tools still exist, and only when ownership is proven.
 $UvReceipt = "$env:LOCALAPPDATA\uv\uv-receipt.json"
 if (Test-Path -LiteralPath $UvReceipt -PathType Leaf) {
     try {
         $Receipt = Get-Content -LiteralPath $UvReceipt -Raw | ConvertFrom-Json
-        $ExpectedPrefix = [System.IO.Path]::GetFullPath("$Root\tools\uv")
+        $ExpectedPrefix = Get-NormalizedPath "$Root\tools\uv"
 
-        if ($Receipt.install_prefix -and [System.IO.Path]::GetFullPath([string]$Receipt.install_prefix).Equals($ExpectedPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+        if ($Receipt.install_prefix -and
+            (Get-NormalizedPath ([string]$Receipt.install_prefix)).Equals(
+                $ExpectedPrefix,
+                [System.StringComparison]::OrdinalIgnoreCase
+            )) {
             if ($PSCmdlet.ShouldProcess($UvReceipt, 'Remove owned uv installer receipt')) {
                 Remove-Item -LiteralPath $UvReceipt -Force
             }
@@ -64,6 +60,22 @@ if (Test-Path -LiteralPath $UvReceipt -PathType Leaf) {
     } catch {
         Write-Warning "Could not verify ownership of uv receipt; preserved: $UvReceipt"
     }
+}
+
+foreach ($Path in $OwnedPaths) {
+    if ((Test-Path -LiteralPath $Path) -and $PSCmdlet.ShouldProcess($Path, 'Remove managed installation data')) {
+        Remove-Item -LiteralPath $Path -Recurse -Force
+    }
+}
+
+if ($RemoveModels) {
+    if (-not $ActualModels.Equals($DefaultModels, [System.StringComparison]::OrdinalIgnoreCase)) {
+        Write-Warning "ModelsRoot is external and will NOT be deleted: $ActualModels"
+    } elseif ((Test-Path -LiteralPath $DefaultModels) -and $PSCmdlet.ShouldProcess($DefaultModels, 'Remove local models')) {
+        Remove-Item -LiteralPath $DefaultModels -Recurse -Force
+    }
+} elseif (Test-Path -LiteralPath $ActualModels) {
+    Write-Host "Models preserved: $ActualModels" -ForegroundColor Yellow
 }
 
 $Config = "$Root\config.psd1"

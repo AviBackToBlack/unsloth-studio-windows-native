@@ -67,9 +67,6 @@ namespace UnslothStudioWindowsNative {
                     throw new Win32Exception(Marshal.GetLastWin32Error());
                 }
 
-                // Volume GUIDs collapse local drive-letter / extended-path aliases.
-                // Remote filesystems may not expose a volume GUID, so fall back to
-                // the normalized DOS/UNC form returned by Windows.
                 try {
                     return GetFinalPathWithFlags(handle, VOLUME_NAME_GUID);
                 } catch (Win32Exception) {
@@ -131,6 +128,32 @@ function Test-PathInsideOrEqual {
     )
 }
 
+function Assert-ManagedChildPhysicalLocation {
+    param(
+        [Parameter(Mandatory)][string]$InstallationRoot,
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$RelativePath
+    )
+
+    $root = Get-NormalizedPath $InstallationRoot
+    $pathNormalized = Get-NormalizedPath $Path
+    $expectedLexical = Get-NormalizedPath (Join-Path $root $RelativePath)
+
+    if (-not $pathNormalized.Equals($expectedLexical, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Managed path must use the expected location '$expectedLexical': $pathNormalized"
+    }
+
+    if ((Test-Path -LiteralPath $root) -and (Test-Path -LiteralPath $pathNormalized)) {
+        $rootFinal = Get-CanonicalExistingPath $root
+        $pathFinal = Get-CanonicalExistingPath $pathNormalized
+        $expectedFinal = (Join-Path $rootFinal $RelativePath).TrimEnd('\')
+
+        if (-not $pathFinal.Equals($expectedFinal, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "Managed path resolves through a filesystem alias/junction outside its expected location '$expectedLexical': $pathFinal"
+        }
+    }
+}
+
 function Assert-SafeModelsRoot {
     param(
         [Parameter(Mandatory)][string]$InstallationRoot,
@@ -141,15 +164,16 @@ function Assert-SafeModelsRoot {
     $models = Get-NormalizedPath $ModelsRoot
     $defaultModels = Get-NormalizedPath (Join-Path $root 'models')
 
-    # The default local model directory is intentionally inside the installation
-    # root and is handled specially by uninstall.
     if ($models.Equals($defaultModels, [System.StringComparison]::OrdinalIgnoreCase)) {
+        # The default spelling is allowed only when it physically resolves to
+        # the real <root>\models directory, never a junction/alias elsewhere.
+        Assert-ManagedChildPhysicalLocation `
+            -InstallationRoot $root `
+            -Path $models `
+            -RelativePath 'models'
         return
     }
 
-    # First reject lexical overlap. When both paths exist, repeat the decision
-    # using Win32 final paths so junctions, extended paths, drive aliases, and
-    # other equivalent filesystem names cannot bypass destructive safety checks.
     if ((Test-PathInsideOrEqual -Path $models -Parent $root) -or
         (Test-PathInsideOrEqual -Path $root -Parent $models)) {
         throw "ModelsRoot must be either '$defaultModels' or a non-overlapping external path. Refusing: $models"
@@ -161,6 +185,21 @@ function Assert-SafeModelsRoot {
             throw "ModelsRoot resolves through a filesystem alias/junction to overlap the installation root. Refusing: $models"
         }
     }
+}
+
+function Test-CommandLineReferencesRuntime {
+    param(
+        [Parameter(Mandatory)][string]$CommandLine,
+        [Parameter(Mandatory)][string]$RuntimePath
+    )
+
+    if ([string]::IsNullOrWhiteSpace($CommandLine)) {
+        return $false
+    }
+
+    $escaped = [regex]::Escape((Get-NormalizedPath $RuntimePath))
+    $pattern = "(?i)(?:^|[\s`\"'])$escaped(?=$|[\\/\s`\"'])"
+    return [regex]::IsMatch($CommandLine, $pattern)
 }
 
 function Get-UnslothManagedProcesses {
@@ -181,9 +220,17 @@ function Get-UnslothManagedProcesses {
 
                 $exe = [string]$_.ExecutablePath
                 $cmd = [string]$_.CommandLine
+                $exeManaged = $false
 
-                ($exe -and (Test-PathInsideOrEqual -Path $exe -Parent $runtime -PhysicalWhenPossible)) -or
-                ($cmd -and $cmd.IndexOf($runtime, [System.StringComparison]::OrdinalIgnoreCase) -ge 0)
+                if ($exe) {
+                    try {
+                        $exeManaged = Test-PathInsideOrEqual -Path $exe -Parent $runtime -PhysicalWhenPossible
+                    } catch {
+                        $exeManaged = $false
+                    }
+                }
+
+                $exeManaged -or (Test-CommandLineReferencesRuntime -CommandLine $cmd -RuntimePath $runtime)
             } |
             Select-Object ProcessId, ParentProcessId, Name, ExecutablePath, CommandLine
     )
@@ -192,8 +239,6 @@ function Get-UnslothManagedProcesses {
 function Assert-UnslothStopped {
     param([Parameter(Mandatory)][string]$InstallationRoot)
 
-    # Get-UnslothManagedProcesses intentionally fails closed. Destructive or
-    # mutating maintenance must not proceed when process ownership is unknown.
     $managed = @(Get-UnslothManagedProcesses -InstallationRoot $InstallationRoot)
     if ($managed.Count -eq 0) {
         return

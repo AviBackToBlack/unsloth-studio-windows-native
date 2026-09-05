@@ -1,6 +1,7 @@
 $ErrorActionPreference = 'Stop'
 
 $Root = $PSScriptRoot
+. "$Root\scripts\common.ps1"
 . "$Root\scripts\env.ps1"
 
 $Cli = "$Root\runtime\bin\unsloth.cmd"
@@ -14,9 +15,7 @@ if (-not (Test-Path -LiteralPath $Py -PathType Leaf)) {
     throw "Managed Studio Python not found: $Py"
 }
 
-if (Get-NetTCPConnection -LocalPort $script:UnslothPort -State Listen -ErrorAction SilentlyContinue) {
-    throw "A process is listening on Studio port $script:UnslothPort. Stop Studio before updating."
-}
+Assert-UnslothStopped -InstallationRoot $Root
 
 $UserPathBefore = [Environment]::GetEnvironmentVariable('Path', 'User')
 $MachinePathBefore = [Environment]::GetEnvironmentVariable('Path', 'Machine')
@@ -31,9 +30,10 @@ foreach ($File in @(
     "$Root\runtime\studio.db"
     "$Root\runtime\auth\auth.db"
 )) {
-    if (Test-Path -LiteralPath $File -PathType Leaf) {
-        Copy-Item -LiteralPath $File -Destination $Backup
+    if (-not (Test-Path -LiteralPath $File -PathType Leaf)) {
+        throw "Required Studio state database is missing: $File"
     }
+    Copy-Item -LiteralPath $File -Destination $Backup
 }
 
 Write-Host "`n=== BEFORE ===" -ForegroundColor Cyan
@@ -92,6 +92,7 @@ import sqlite3
 from pathlib import Path
 
 root = Path(os.environ["UNSLOTH_NATIVE_ROOT"])
+failed = False
 
 for name, p in (
     ("studio", root / "runtime" / "studio.db"),
@@ -99,11 +100,29 @@ for name, p in (
 ):
     if not p.exists():
         print(name, "MISSING")
+        failed = True
         continue
-    con = sqlite3.connect(p)
-    print(name, con.execute("PRAGMA integrity_check").fetchone()[0])
-    con.close()
+
+    con = None
+    try:
+        con = sqlite3.connect(p)
+        result = con.execute("PRAGMA integrity_check").fetchone()[0]
+        print(name, result)
+        if result != "ok":
+            failed = True
+    except Exception as exc:
+        print(name, "ERROR", repr(exc))
+        failed = True
+    finally:
+        if con is not None:
+            con.close()
+
+raise SystemExit(1 if failed else 0)
 '@
+
+if ($LASTEXITCODE -ne 0) {
+    throw "Database integrity validation failed after update. Backup is available at: $Backup"
+}
 
 $UserPathAfter = [Environment]::GetEnvironmentVariable('Path', 'User')
 $MachinePathAfter = [Environment]::GetEnvironmentVariable('Path', 'Machine')

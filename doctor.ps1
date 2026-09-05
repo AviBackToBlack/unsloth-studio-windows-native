@@ -1,6 +1,7 @@
 $ErrorActionPreference = 'Continue'
 
 $Root = $PSScriptRoot
+. "$Root\scripts\common.ps1"
 . "$Root\scripts\env.ps1"
 
 $Py = "$Root\runtime\unsloth_studio\Scripts\python.exe"
@@ -13,6 +14,12 @@ Write-Host "`n=== INSTALLATION ===" -ForegroundColor Cyan
     Config = "$Root\config.psd1"
     ConfigExists = Test-Path -LiteralPath "$Root\config.psd1" -PathType Leaf
 } | Format-List
+
+try {
+    Assert-SafeModelsRoot -InstallationRoot $Root -ModelsRoot $script:UnslothModels
+} catch {
+    $Issues.Add($_.Exception.Message)
+}
 
 if (-not (Test-Path -LiteralPath $Py -PathType Leaf)) {
     $Issues.Add("Managed Studio Python is missing: $Py")
@@ -52,20 +59,42 @@ raise SystemExit(0 if torch.cuda.is_available() else 2)
     Write-Host "`n=== STATE ===" -ForegroundColor Cyan
 
     & $Py -c @'
-import os, sqlite3
+import os
+import sqlite3
 from pathlib import Path
+
 root = Path(os.environ["UNSLOTH_NATIVE_ROOT"])
+failed = False
+
 for label, path in (
     ("studio", root / "runtime" / "studio.db"),
     ("auth", root / "runtime" / "auth" / "auth.db"),
 ):
     if not path.exists():
         print(f"{label:10} NOT INITIALIZED")
+        failed = True
         continue
-    con = sqlite3.connect(path)
-    print(f"{label:10} {con.execute('PRAGMA integrity_check').fetchone()[0]}")
-    con.close()
+
+    con = None
+    try:
+        con = sqlite3.connect(path)
+        result = con.execute("PRAGMA integrity_check").fetchone()[0]
+        print(f"{label:10} {result}")
+        if result != "ok":
+            failed = True
+    except Exception as exc:
+        print(f"{label:10} ERROR {exc!r}")
+        failed = True
+    finally:
+        if con is not None:
+            con.close()
+
+raise SystemExit(1 if failed else 0)
 '@
+
+    if ($LASTEXITCODE -ne 0) {
+        $Issues.Add('Studio state database validation failed.')
+    }
 
     Write-Host "`n=== HF CREDENTIAL ===" -ForegroundColor Cyan
 
@@ -95,27 +124,44 @@ if not db.exists():
     print("Studio state not initialized")
     raise SystemExit(0)
 con = sqlite3.connect(db)
-for _, path in con.execute("SELECT id, path FROM scan_folders ORDER BY id"):
-    p = Path(path)
-    print(f"{p}  exists={p.is_dir()}")
-con.close()
+try:
+    for _, path in con.execute("SELECT id, path FROM scan_folders ORDER BY id"):
+        p = Path(path)
+        print(f"{p}  exists={p.is_dir()}")
+finally:
+    con.close()
 '@
 }
 
 Write-Host "`n=== MANAGED COMPONENTS ===" -ForegroundColor Cyan
-$ManagedRows = foreach ($Path in @(
+$ManagedPaths = @(
     "$Root\tools\uv\uv.exe"
-    "$Root\python\cpython-3.13-windows-x86_64-none\python.exe"
     "$Root\runtime\bin\unsloth.cmd"
     "$Root\runtime\llama.cpp\build\bin\Release\llama-server.exe"
     "$Root\runtime\whisper.cpp\build\bin\Release\whisper-server.exe"
     "$Root\runtime\node\node.exe"
-)) {
+)
+
+if ($script:UnslothBasePython) {
+    $ManagedPaths = @($ManagedPaths[0], $script:UnslothBasePython) + $ManagedPaths[1..($ManagedPaths.Count - 1)]
+} else {
+    $Issues.Add('Could not resolve the managed base Python 3.13 interpreter.')
+}
+
+$ManagedRows = foreach ($Path in $ManagedPaths) {
     $Exists = Test-Path -LiteralPath $Path -PathType Leaf
     if (-not $Exists) { $Issues.Add("Managed component missing: $Path") }
     [pscustomobject]@{ Path = $Path; Exists = $Exists }
 }
 $ManagedRows | Format-Table -AutoSize
+
+Write-Host "`n=== MANAGED PROCESSES ===" -ForegroundColor Cyan
+$ManagedProcesses = @(Get-UnslothManagedProcesses -InstallationRoot $Root)
+if ($ManagedProcesses.Count -gt 0) {
+    $ManagedProcesses | Select-Object ProcessId, Name, ExecutablePath | Format-Table -AutoSize
+} else {
+    Write-Host 'None'
+}
 
 Write-Host "`n=== ISOLATION ===" -ForegroundColor Cyan
 $UserPathHasRoot = [Environment]::GetEnvironmentVariable('Path','User') -match [regex]::Escape($Root)
@@ -126,6 +172,7 @@ $MachinePathHasRoot = [Environment]::GetEnvironmentVariable('Path','Machine') -m
     MachinePathHasInstallationRoot = $MachinePathHasRoot
     GlobalCMake = (Get-Command cmake.exe -CommandType Application -ErrorAction SilentlyContinue).Source
     GlobalNVCC = (Get-Command nvcc.exe -CommandType Application -ErrorAction SilentlyContinue).Source
+    TorchInductorCache = $env:TORCHINDUCTOR_CACHE_DIR
 } | Format-List
 
 if ($UserPathHasRoot) { $Issues.Add('Installation root appears in persistent User PATH.') }

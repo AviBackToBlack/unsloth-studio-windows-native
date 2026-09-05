@@ -22,19 +22,29 @@ Write-Host 'External model libraries are never deleted.'
 $DefaultModels = Get-NormalizedPath (Join-Path $Root 'models')
 $ActualModels = Get-NormalizedPath $script:UnslothModels
 
-# Validate every removal target before deleting anything.
-$OwnedPaths = @(
-    "$Root\runtime"
-    "$Root\tools"
-    "$Root\python"
-    "$Root\cache"
-    "$Root\logs"
-    "$Root\work"
-    "$Root\forensic"
-)
+# Validate every managed removal target physically before deleting anything.
+# The containment promise does not allow runtime/tools/cache/etc. to be
+# junctions that redirect deletion outside the installation root.
+$OwnedPaths = [ordered]@{
+    runtime = "$Root\runtime"
+    tools = "$Root\tools"
+    python = "$Root\python"
+    cache = "$Root\cache"
+    logs = "$Root\logs"
+    work = "$Root\work"
+    forensic = "$Root\forensic"
+}
 
-foreach ($Owned in $OwnedPaths) {
-    if (Test-PathInsideOrEqual -Path $ActualModels -Parent $Owned) {
+foreach ($Relative in $OwnedPaths.Keys) {
+    $Owned = $OwnedPaths[$Relative]
+    if (Test-Path -LiteralPath $Owned) {
+        Assert-ManagedChildPhysicalLocation `
+            -InstallationRoot $Root `
+            -Path $Owned `
+            -RelativePath $Relative
+    }
+
+    if (Test-PathInsideOrEqual -Path $ActualModels -Parent $Owned -PhysicalWhenPossible) {
         throw "Refusing uninstall because ModelsRoot overlaps managed path '$Owned': $ActualModels"
     }
 }
@@ -62,7 +72,7 @@ if (Test-Path -LiteralPath $UvReceipt -PathType Leaf) {
     }
 }
 
-foreach ($Path in $OwnedPaths) {
+foreach ($Path in $OwnedPaths.Values) {
     if ((Test-Path -LiteralPath $Path) -and $PSCmdlet.ShouldProcess($Path, 'Remove managed installation data')) {
         Remove-Item -LiteralPath $Path -Recurse -Force
     }
@@ -72,6 +82,8 @@ if ($RemoveModels) {
     if (-not $ActualModels.Equals($DefaultModels, [System.StringComparison]::OrdinalIgnoreCase)) {
         Write-Warning "ModelsRoot is external and will NOT be deleted: $ActualModels"
     } elseif ((Test-Path -LiteralPath $DefaultModels) -and $PSCmdlet.ShouldProcess($DefaultModels, 'Remove local models')) {
+        # Assert-SafeModelsRoot already proved that the default path is not a
+        # junction/alias before any managed tree was removed.
         Remove-Item -LiteralPath $DefaultModels -Recurse -Force
     }
 } elseif (Test-Path -LiteralPath $ActualModels) {

@@ -79,6 +79,17 @@ namespace UnslothStudioWindowsNative {
 '@
 }
 
+function Remove-TrailingSeparatorUnlessRoot {
+    param([Parameter(Mandatory)][string]$Path)
+
+    $pathRoot = [System.IO.Path]::GetPathRoot($Path)
+    if ($pathRoot -and $Path.Equals($pathRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+        return $pathRoot
+    }
+
+    return $Path.TrimEnd([char[]]'\/')
+}
+
 function Get-NormalizedPath {
     param([Parameter(Mandatory)][string]$Path)
 
@@ -87,7 +98,8 @@ function Get-NormalizedPath {
         throw "Path must be fully qualified: $Path"
     }
 
-    return [System.IO.Path]::GetFullPath($trimmed).TrimEnd('\')
+    $full = [System.IO.Path]::GetFullPath($trimmed)
+    return Remove-TrailingSeparatorUnlessRoot $full
 }
 
 function Get-CanonicalExistingPath {
@@ -98,7 +110,8 @@ function Get-CanonicalExistingPath {
         throw "Cannot canonicalize a path that does not exist: $normalized"
     }
 
-    return [UnslothStudioWindowsNative.NativePath]::GetFinalPath($normalized).TrimEnd('\')
+    $final = [UnslothStudioWindowsNative.NativePath]::GetFinalPath($normalized)
+    return Remove-TrailingSeparatorUnlessRoot $final
 }
 
 function Test-PathInsideOrEqual {
@@ -122,10 +135,13 @@ function Test-PathInsideOrEqual {
         return $true
     }
 
-    return $child.StartsWith(
-        $root + '\',
-        [System.StringComparison]::OrdinalIgnoreCase
-    )
+    $prefix = if ($root.EndsWith('\') -or $root.EndsWith('/')) {
+        $root
+    } else {
+        $root + '\'
+    }
+
+    return $child.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)
 }
 
 function Assert-ManagedChildPhysicalLocation {
@@ -137,7 +153,7 @@ function Assert-ManagedChildPhysicalLocation {
 
     $root = Get-NormalizedPath $InstallationRoot
     $pathNormalized = Get-NormalizedPath $Path
-    $expectedLexical = Get-NormalizedPath (Join-Path $root $RelativePath)
+    $expectedLexical = Get-NormalizedPath ([System.IO.Path]::Combine($root, $RelativePath))
 
     if (-not $pathNormalized.Equals($expectedLexical, [System.StringComparison]::OrdinalIgnoreCase)) {
         throw "Managed path must use the expected location '$expectedLexical': $pathNormalized"
@@ -146,7 +162,7 @@ function Assert-ManagedChildPhysicalLocation {
     if ((Test-Path -LiteralPath $root) -and (Test-Path -LiteralPath $pathNormalized)) {
         $rootFinal = Get-CanonicalExistingPath $root
         $pathFinal = Get-CanonicalExistingPath $pathNormalized
-        $expectedFinal = [System.IO.Path]::Combine($rootFinal, $RelativePath).TrimEnd('\')
+        $expectedFinal = Get-NormalizedPath ([System.IO.Path]::Combine($rootFinal, $RelativePath))
 
         if (-not $pathFinal.Equals($expectedFinal, [System.StringComparison]::OrdinalIgnoreCase)) {
             throw "Managed path resolves through a filesystem alias/junction outside its expected location '$expectedLexical': $pathFinal"
@@ -162,7 +178,7 @@ function Assert-SafeModelsRoot {
 
     $root = Get-NormalizedPath $InstallationRoot
     $models = Get-NormalizedPath $ModelsRoot
-    $defaultModels = Get-NormalizedPath (Join-Path $root 'models')
+    $defaultModels = Get-NormalizedPath ([System.IO.Path]::Combine($root, 'models'))
 
     if ($models.Equals($defaultModels, [System.StringComparison]::OrdinalIgnoreCase)) {
         Assert-ManagedChildPhysicalLocation `
@@ -185,6 +201,58 @@ function Assert-SafeModelsRoot {
     }
 }
 
+function Enter-UnslothOperationLock {
+    param(
+        [Parameter(Mandatory)][string]$InstallationRoot,
+        [Parameter(Mandatory)][string]$Operation
+    )
+
+    $root = Get-NormalizedPath $InstallationRoot
+    $lockPath = [System.IO.Path]::Combine($root, '.unsloth-operation.lock')
+
+    try {
+        $stream = [System.IO.File]::Open(
+            $lockPath,
+            [System.IO.FileMode]::OpenOrCreate,
+            [System.IO.FileAccess]::ReadWrite,
+            [System.IO.FileShare]::None
+        )
+    } catch [System.IO.IOException] {
+        throw "Another Unsloth Studio start/maintenance operation is active for '$root'. Refusing '$Operation'."
+    }
+
+    try {
+        $stream.SetLength(0)
+        $writer = [System.IO.StreamWriter]::new(
+            $stream,
+            [System.Text.UTF8Encoding]::new($false),
+            1024,
+            $true
+        )
+        try {
+            $writer.WriteLine("operation=$Operation")
+            $writer.WriteLine("pid=$PID")
+            $writer.WriteLine("started=$((Get-Date).ToString('o'))")
+            $writer.Flush()
+            $stream.Flush()
+        } finally {
+            $writer.Dispose()
+        }
+        return $stream
+    } catch {
+        $stream.Dispose()
+        throw
+    }
+}
+
+function Exit-UnslothOperationLock {
+    param([System.IO.FileStream]$Lock)
+
+    if ($null -ne $Lock) {
+        $Lock.Dispose()
+    }
+}
+
 function Test-CommandLineReferencesRuntime {
     param(
         [Parameter(Mandatory)][string]$CommandLine,
@@ -203,7 +271,7 @@ function Test-CommandLineReferencesRuntime {
 function Get-UnslothManagedProcesses {
     param([Parameter(Mandatory)][string]$InstallationRoot)
 
-    $runtime = Get-NormalizedPath (Join-Path $InstallationRoot 'runtime')
+    $runtime = Get-NormalizedPath ([System.IO.Path]::Combine((Get-NormalizedPath $InstallationRoot), 'runtime'))
 
     try {
         $processes = @(Get-CimInstance Win32_Process -ErrorAction Stop)

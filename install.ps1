@@ -101,19 +101,20 @@ if (Test-Path -LiteralPath $ExistingConfigPath -PathType Leaf) {
 if ([string]::IsNullOrWhiteSpace($ModelsRoot)) {
     if ($ExistingConfig -and -not [string]::IsNullOrWhiteSpace($ExistingConfig.ModelsRoot)) {
         $ExistingModelsRoot = [string]$ExistingConfig.ModelsRoot
-        if (-not [System.IO.Path]::IsPathRooted($ExistingModelsRoot)) {
-            throw "ModelsRoot in existing config.psd1 must be an absolute path: $ExistingModelsRoot"
+        if (-not [System.IO.Path]::IsPathFullyQualified($ExistingModelsRoot)) {
+            throw "ModelsRoot in existing config.psd1 must be a fully qualified absolute path: $ExistingModelsRoot"
         }
         $ModelsRoot = [System.IO.Path]::GetFullPath($ExistingModelsRoot)
     } else {
         $ModelsRoot = Join-Path $Root 'models'
     }
-} elseif (-not [System.IO.Path]::IsPathRooted($ModelsRoot)) {
-    throw '-ModelsRoot must be an absolute path.'
+} elseif (-not [System.IO.Path]::IsPathFullyQualified($ModelsRoot)) {
+    throw '-ModelsRoot must be a fully qualified absolute path.'
 } else {
     $ModelsRoot = [System.IO.Path]::GetFullPath($ModelsRoot)
 }
 
+# Reject lexical overlap before creating anything.
 Assert-SafeModelsRoot -InstallationRoot $Root -ModelsRoot $ModelsRoot
 
 $Dirs = @(
@@ -136,6 +137,10 @@ $Dirs = @(
 foreach ($Dir in $Dirs) {
     [System.IO.Directory]::CreateDirectory($Dir) | Out-Null
 }
+
+# Re-run the safety check now that the model path exists so junctions, aliases,
+# and extended-path spellings are resolved through Win32 final paths.
+Assert-SafeModelsRoot -InstallationRoot $Root -ModelsRoot $ModelsRoot
 
 $escapedModelsRoot = $ModelsRoot.Replace("'", "''")
 $Port = if ($ExistingConfig -and $null -ne $ExistingConfig.Port) { [int]$ExistingConfig.Port } else { 8888 }

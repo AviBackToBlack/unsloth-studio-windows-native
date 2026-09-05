@@ -4,7 +4,6 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-Set-StrictMode -Version Latest
 
 $Root = [System.IO.Path]::GetFullPath($PSScriptRoot)
 $Pwsh = (Get-Process -Id $PID).Path

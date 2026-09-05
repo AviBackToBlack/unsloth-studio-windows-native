@@ -51,8 +51,14 @@ function Get-UnslothManagedProcesses {
 
     $runtime = Get-NormalizedPath (Join-Path $InstallationRoot 'runtime')
 
+    try {
+        $processes = @(Get-CimInstance Win32_Process -ErrorAction Stop)
+    } catch {
+        throw "Could not enumerate Windows processes through CIM/WMI; managed-process ownership cannot be established safely. $($_.Exception.Message)"
+    }
+
     @(
-        Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+        $processes |
             Where-Object {
                 if ($_.ProcessId -eq $PID) { return $false }
 
@@ -69,6 +75,8 @@ function Get-UnslothManagedProcesses {
 function Assert-UnslothStopped {
     param([Parameter(Mandatory)][string]$InstallationRoot)
 
+    # Get-UnslothManagedProcesses intentionally fails closed. Destructive or
+    # mutating maintenance must not proceed when process ownership is unknown.
     $managed = @(Get-UnslothManagedProcesses -InstallationRoot $InstallationRoot)
     if ($managed.Count -eq 0) {
         return

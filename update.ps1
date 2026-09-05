@@ -37,7 +37,9 @@ foreach ($File in @(
 
 # Use SQLite's online backup API rather than raw file copies. This captures
 # committed transactions that may still live in WAL files after a crash.
-& $Py -c @'
+$env:UNSLOTH_UPDATE_BACKUP = $Backup
+try {
+    & $Py -c @'
 import os
 import sqlite3
 from pathlib import Path
@@ -63,8 +65,12 @@ for src, dst in (
         target.close()
         source.close()
 '@
+    $BackupExit = $LASTEXITCODE
+} finally {
+    Remove-Item Env:UNSLOTH_UPDATE_BACKUP -ErrorAction SilentlyContinue
+}
 
-if ($LASTEXITCODE -ne 0) {
+if ($BackupExit -ne 0) {
     throw "WAL-aware database backup failed: $Backup"
 }
 

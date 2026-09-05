@@ -22,7 +22,8 @@ unsloth-studio-windows-native/
 ├── uninstall.ps1
 ├── config.psd1              # generated locally; ignored by Git
 ├── scripts/
-│   └── env.ps1
+│   ├── env.ps1
+│   └── common.ps1
 ├── runtime/                 # Unsloth Studio, venv, Node, llama.cpp, state
 ├── python/                  # uv-managed CPython
 ├── tools/                   # uv
@@ -78,15 +79,27 @@ To use an existing model library:
 pwsh .\install.ps1 -ModelsRoot 'D:\AI\Models'
 ```
 
+`ModelsRoot` must be either the default `<root>\models` directory or a genuinely external, non-overlapping absolute path. Paths inside `runtime`, `cache`, or other managed trees are rejected so uninstall cannot accidentally remove model data.
+
 `install.ps1`:
 
 1. verifies host prerequisites;
 2. records a small pre-install forensic baseline;
-3. installs the latest uv into `<root>\tools\uv`;
-4. installs managed CPython 3.13 into `<root>\python`;
-5. downloads the current official Unsloth installer and records its SHA-256;
+3. installs or refreshes uv under `<root>\tools\uv`;
+4. installs managed CPython 3.13 under `<root>\python` and records the resolved interpreter path;
+5. downloads the current official Unsloth installer and records its SHA-256 for auditing;
 6. runs it with a process-local containment environment;
 7. validates CUDA, core managed components, persistent PATH and build-tool leakage.
+
+### Repair a partial installation
+
+If an install is interrupted after managed files have already been created, rerun:
+
+```powershell
+pwsh .\install.ps1 -Repair
+```
+
+Repair mode preserves existing managed files and Studio state where possible, refreshes uv/Python, reruns the current official Unsloth installer, and repeats validation. It does not require manually guessing which partial directories to delete.
 
 ## Start
 
@@ -94,13 +107,15 @@ pwsh .\install.ps1 -ModelsRoot 'D:\AI\Models'
 pwsh .\start.ps1
 ```
 
-Default listener:
+The primary listener is intentionally loopback-only:
 
 ```text
 http://127.0.0.1:8888
 ```
 
-Edit the generated `config.psd1` to change the port, bind host or model library.
+Edit the generated `config.psd1` to change the port or model library.
+
+For network access, use **Unsloth Studio's own Remote & LAN settings**. This wrapper does not expose the primary listener with `0.0.0.0` or another configurable bind address.
 
 `start.ps1` intentionally does **not** auto-update the installation.
 
@@ -112,13 +127,15 @@ Stop Studio first, then:
 pwsh .\update.ps1
 ```
 
-The updater uses the official:
+The updater detects managed processes belonging to this installation rather than treating any listener on the configured port as Studio.
+
+It uses the official:
 
 ```text
 unsloth studio update
 ```
 
-Before updating it backs up `studio.db` and `auth.db`. Afterward it validates CUDA, database integrity, persistent PATH and unexpected CMake/`nvcc` appearance.
+Before updating it requires and backs up `studio.db` and `auth.db`. Afterward it validates CUDA, requires both databases to pass `PRAGMA integrity_check`, verifies persistent PATH, and checks for unexpected CMake/`nvcc` appearance.
 
 ## Health check
 
@@ -134,11 +151,14 @@ The doctor reports:
 - saved Hugging Face credential status
 - model scan folders
 - managed component presence
+- resolved managed base Python
+- managed processes
 - persistent PATH isolation
+- TorchInductor cache location
 - external footprint
 - Studio health endpoint
 
-It exits with a non-zero status when a core health check fails.
+It exits with a non-zero status when a core health check fails, including a missing, unreadable, or corrupt Studio/auth database after Studio has been initialized.
 
 ## Hugging Face model sync
 
@@ -177,7 +197,9 @@ The Hugging Face `local_dir` metadata remains alongside the model; the script do
 pwsh .\uninstall.ps1
 ```
 
-The script removes managed installation data but preserves:
+The script refuses to run while processes from this installation's `runtime` are active. Before deleting anything it also revalidates that `ModelsRoot` does not overlap managed directories.
+
+It removes managed installation data but preserves:
 
 - repository files;
 - models by default;
@@ -220,6 +242,17 @@ The official uv installer currently writes:
 even when `UV_INSTALL_DIR` points inside the project root. This file is small and contains installer metadata, not Python packages or caches.
 
 `uninstall.ps1` removes it **only when its `install_prefix` proves that it belongs to this installation**.
+
+## Supply-chain trust model
+
+This project intentionally tracks the **current** official installers rather than pinning a historical Unsloth release. At install/repair time it executes PowerShell downloaded over HTTPS from:
+
+- `https://astral.sh/uv/install.ps1`
+- `https://unsloth.ai/install.ps1`
+
+Those official HTTPS endpoints are therefore part of the trust boundary. The installer records SHA-256 digests of the downloaded scripts for forensic/audit purposes, but a digest computed after download is **not independent authenticity verification** of a mutable endpoint.
+
+A future release may add an independently maintained signed/pinned manifest mode without changing the default "current official installer" workflow.
 
 ## License
 

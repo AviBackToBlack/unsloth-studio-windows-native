@@ -114,7 +114,6 @@ if ([string]::IsNullOrWhiteSpace($ModelsRoot)) {
     $ModelsRoot = [System.IO.Path]::GetFullPath($ModelsRoot)
 }
 
-# Reject lexical overlap before creating anything.
 Assert-SafeModelsRoot -InstallationRoot $Root -ModelsRoot $ModelsRoot
 
 $Dirs = @(
@@ -138,8 +137,10 @@ foreach ($Dir in $Dirs) {
     [System.IO.Directory]::CreateDirectory($Dir) | Out-Null
 }
 
-# Re-run the safety check now that the model path exists so junctions, aliases,
-# and extended-path spellings are resolved through Win32 final paths.
+# Re-run physical safety checks after directories exist. Managed Python must be
+# the real <root>\python directory and the default models directory may not be
+# a junction/alias to another managed or external location.
+Assert-ManagedChildPhysicalLocation -InstallationRoot $Root -Path "$Root\python" -RelativePath 'python'
 Assert-SafeModelsRoot -InstallationRoot $Root -ModelsRoot $ModelsRoot
 
 $escapedModelsRoot = $ModelsRoot.Replace("'", "''")
@@ -158,6 +159,17 @@ $Baseline = "$Root\forensic\preinstall\$Stamp"
 $UserPathBefore = [Environment]::GetEnvironmentVariable('Path', 'User')
 $MachinePathBefore = [Environment]::GetEnvironmentVariable('Path', 'Machine')
 
+$KnownExternalPaths = [ordered]@{
+    ProfileUnsloth = "$env:USERPROFILE\.unsloth"
+    LocalAppDataUnsloth = "$env:LOCALAPPDATA\Unsloth Studio"
+    RoamingAppDataUnsloth = "$env:APPDATA\Unsloth Studio"
+}
+
+$ExternalBefore = [ordered]@{}
+foreach ($Name in $KnownExternalPaths.Keys) {
+    $ExternalBefore[$Name] = Test-Path -LiteralPath $KnownExternalPaths[$Name]
+}
+
 [pscustomobject]@{
     Timestamp = (Get-Date).ToString('o')
     Mode = if ($Repair) { 'repair' } else { 'install' }
@@ -169,9 +181,9 @@ $MachinePathBefore = [Environment]::GetEnvironmentVariable('Path', 'Machine')
     NVCC = (Get-Command nvcc.exe -CommandType Application -ErrorAction SilentlyContinue).Source
     Node = (Get-Command node.exe -CommandType Application -ErrorAction SilentlyContinue).Source
     Python = (Get-Command python.exe -CommandType Application -ErrorAction SilentlyContinue).Source
-    ProfileUnsloth = Test-Path -LiteralPath "$env:USERPROFILE\.unsloth"
-    LocalAppDataUnsloth = Test-Path -LiteralPath "$env:LOCALAPPDATA\Unsloth Studio"
-    RoamingAppDataUnsloth = Test-Path -LiteralPath "$env:APPDATA\Unsloth Studio"
+    ProfileUnsloth = $ExternalBefore.ProfileUnsloth
+    LocalAppDataUnsloth = $ExternalBefore.LocalAppDataUnsloth
+    RoamingAppDataUnsloth = $ExternalBefore.RoamingAppDataUnsloth
 } | ConvertTo-Json -Depth 5 |
     Set-Content -LiteralPath "$Baseline\baseline.json" -Encoding utf8
 
@@ -193,6 +205,7 @@ if (-not (Test-Path -LiteralPath $script:UnslothUv -PathType Leaf)) {
 & $script:UnslothUv --version
 
 Write-Host "`n=== INSTALL / REFRESH PYTHON 3.13 ===" -ForegroundColor Cyan
+Assert-ManagedChildPhysicalLocation -InstallationRoot $Root -Path "$Root\python" -RelativePath 'python'
 & $script:UnslothUv python install 3.13 --no-bin --no-config
 if ($LASTEXITCODE -ne 0) {
     throw "uv python install failed with exit code $LASTEXITCODE"
@@ -205,9 +218,9 @@ if (-not $ResolvedPython -or -not (Test-Path -LiteralPath $ResolvedPython -PathT
 
 $PythonRootExpected = [System.IO.Path]::GetFullPath("$Root\python").TrimEnd('\')
 $PythonResolvedFull = [System.IO.Path]::GetFullPath($ResolvedPython)
-if (-not ($PythonResolvedFull.Equals($PythonRootExpected, [System.StringComparison]::OrdinalIgnoreCase) -or
-          $PythonResolvedFull.StartsWith($PythonRootExpected + '\', [System.StringComparison]::OrdinalIgnoreCase))) {
-    throw "Managed Python escaped the installation root: $PythonResolvedFull"
+Assert-ManagedChildPhysicalLocation -InstallationRoot $Root -Path $PythonRootExpected -RelativePath 'python'
+if (-not (Test-PathInsideOrEqual -Path $PythonResolvedFull -Parent $PythonRootExpected -PhysicalWhenPossible)) {
+    throw "Managed Python escaped the physical installation Python root: $PythonResolvedFull"
 }
 
 [ordered]@{
@@ -217,7 +230,6 @@ if (-not ($PythonResolvedFull.Equals($PythonRootExpected, [System.StringComparis
 } | ConvertTo-Json -Depth 3 |
     Set-Content -LiteralPath "$Root\forensic\managed-python.json" -Encoding utf8
 
-# Reload env so process-local PATH uses the actual interpreter directory.
 . "$Root\scripts\env.ps1"
 & $ResolvedPython --version
 
@@ -286,6 +298,17 @@ if (-not $BaselineData.CMake -and $CMakeAfter) {
 }
 if (-not $BaselineData.NVCC -and $NvccAfter) {
     throw "Unexpected global nvcc appeared during installation: $NvccAfter"
+}
+
+# Enforce the known external-footprint baseline. The uv receipt under
+# %LOCALAPPDATA%\uv is intentionally allowed and audited separately; these
+# Unsloth profile/AppData locations are not part of the contained layout.
+foreach ($Name in $KnownExternalPaths.Keys) {
+    $existedBefore = [bool]$ExternalBefore[$Name]
+    $existsAfter = Test-Path -LiteralPath $KnownExternalPaths[$Name]
+    if (-not $existedBefore -and $existsAfter) {
+        throw "Unexpected external footprint appeared during installation: $($KnownExternalPaths[$Name])"
+    }
 }
 
 [ordered]@{

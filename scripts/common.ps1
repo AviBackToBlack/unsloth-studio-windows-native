@@ -1,18 +1,125 @@
 # Shared safety helpers for maintenance scripts.
 
+if (-not ('UnslothStudioWindowsNative.NativePath' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Text;
+using Microsoft.Win32.SafeHandles;
+
+namespace UnslothStudioWindowsNative {
+    public static class NativePath {
+        private const uint FILE_SHARE_READ = 0x00000001;
+        private const uint FILE_SHARE_WRITE = 0x00000002;
+        private const uint FILE_SHARE_DELETE = 0x00000004;
+        private const uint OPEN_EXISTING = 3;
+        private const uint FILE_FLAG_BACKUP_SEMANTICS = 0x02000000;
+        private const uint VOLUME_NAME_DOS = 0x0;
+        private const uint VOLUME_NAME_GUID = 0x1;
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern SafeFileHandle CreateFile(
+            string lpFileName,
+            uint dwDesiredAccess,
+            uint dwShareMode,
+            IntPtr lpSecurityAttributes,
+            uint dwCreationDisposition,
+            uint dwFlagsAndAttributes,
+            IntPtr hTemplateFile
+        );
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern uint GetFinalPathNameByHandle(
+            SafeFileHandle hFile,
+            StringBuilder lpszFilePath,
+            uint cchFilePath,
+            uint dwFlags
+        );
+
+        private static string GetFinalPathWithFlags(SafeFileHandle handle, uint flags) {
+            var buffer = new StringBuilder(32768);
+            uint result = GetFinalPathNameByHandle(handle, buffer, (uint)buffer.Capacity, flags);
+            if (result == 0) {
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            }
+            if (result >= buffer.Capacity) {
+                buffer = new StringBuilder((int)result + 1);
+                result = GetFinalPathNameByHandle(handle, buffer, (uint)buffer.Capacity, flags);
+                if (result == 0) {
+                    throw new Win32Exception(Marshal.GetLastWin32Error());
+                }
+            }
+            return buffer.ToString();
+        }
+
+        public static string GetFinalPath(string path) {
+            using (SafeFileHandle handle = CreateFile(
+                path,
+                0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                IntPtr.Zero,
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS,
+                IntPtr.Zero
+            )) {
+                if (handle.IsInvalid) {
+                    throw new Win32Exception(Marshal.GetLastWin32Error());
+                }
+
+                // Volume GUIDs collapse local drive-letter / extended-path aliases.
+                // Remote filesystems may not expose a volume GUID, so fall back to
+                // the normalized DOS/UNC form returned by Windows.
+                try {
+                    return GetFinalPathWithFlags(handle, VOLUME_NAME_GUID);
+                } catch (Win32Exception) {
+                    return GetFinalPathWithFlags(handle, VOLUME_NAME_DOS);
+                }
+            }
+        }
+    }
+}
+'@
+}
+
 function Get-NormalizedPath {
     param([Parameter(Mandatory)][string]$Path)
-    return [System.IO.Path]::GetFullPath($Path).TrimEnd('\')
+
+    $trimmed = $Path.Trim().Trim('"')
+    if (-not [System.IO.Path]::IsPathFullyQualified($trimmed)) {
+        throw "Path must be fully qualified: $Path"
+    }
+
+    return [System.IO.Path]::GetFullPath($trimmed).TrimEnd('\')
+}
+
+function Get-CanonicalExistingPath {
+    param([Parameter(Mandatory)][string]$Path)
+
+    $normalized = Get-NormalizedPath $Path
+    if (-not (Test-Path -LiteralPath $normalized)) {
+        throw "Cannot canonicalize a path that does not exist: $normalized"
+    }
+
+    return [UnslothStudioWindowsNative.NativePath]::GetFinalPath($normalized).TrimEnd('\')
 }
 
 function Test-PathInsideOrEqual {
     param(
         [Parameter(Mandatory)][string]$Path,
-        [Parameter(Mandatory)][string]$Parent
+        [Parameter(Mandatory)][string]$Parent,
+        [switch]$PhysicalWhenPossible
     )
 
     $child = Get-NormalizedPath $Path
     $root = Get-NormalizedPath $Parent
+
+    if ($PhysicalWhenPossible -and
+        (Test-Path -LiteralPath $child) -and
+        (Test-Path -LiteralPath $root)) {
+        $child = Get-CanonicalExistingPath $child
+        $root = Get-CanonicalExistingPath $root
+    }
 
     if ($child.Equals($root, [System.StringComparison]::OrdinalIgnoreCase)) {
         return $true
@@ -34,15 +141,25 @@ function Assert-SafeModelsRoot {
     $models = Get-NormalizedPath $ModelsRoot
     $defaultModels = Get-NormalizedPath (Join-Path $root 'models')
 
+    # The default local model directory is intentionally inside the installation
+    # root and is handled specially by uninstall.
     if ($models.Equals($defaultModels, [System.StringComparison]::OrdinalIgnoreCase)) {
         return
     }
 
-    # External model libraries must be genuinely external. This prevents an
-    # uninstall from ever deleting models through an owned runtime/cache tree.
+    # First reject lexical overlap. When both paths exist, repeat the decision
+    # using Win32 final paths so junctions, extended paths, drive aliases, and
+    # other equivalent filesystem names cannot bypass destructive safety checks.
     if ((Test-PathInsideOrEqual -Path $models -Parent $root) -or
         (Test-PathInsideOrEqual -Path $root -Parent $models)) {
         throw "ModelsRoot must be either '$defaultModels' or a non-overlapping external path. Refusing: $models"
+    }
+
+    if ((Test-Path -LiteralPath $models) -and (Test-Path -LiteralPath $root)) {
+        if ((Test-PathInsideOrEqual -Path $models -Parent $root -PhysicalWhenPossible) -or
+            (Test-PathInsideOrEqual -Path $root -Parent $models -PhysicalWhenPossible)) {
+            throw "ModelsRoot resolves through a filesystem alias/junction to overlap the installation root. Refusing: $models"
+        }
     }
 }
 
@@ -65,10 +182,10 @@ function Get-UnslothManagedProcesses {
                 $exe = [string]$_.ExecutablePath
                 $cmd = [string]$_.CommandLine
 
-                ($exe -and (Test-PathInsideOrEqual -Path $exe -Parent $runtime)) -or
+                ($exe -and (Test-PathInsideOrEqual -Path $exe -Parent $runtime -PhysicalWhenPossible)) -or
                 ($cmd -and $cmd.IndexOf($runtime, [System.StringComparison]::OrdinalIgnoreCase) -ge 0)
             } |
-            Select-Object ProcessId, Name, ExecutablePath, CommandLine
+            Select-Object ProcessId, ParentProcessId, Name, ExecutablePath, CommandLine
     )
 }
 

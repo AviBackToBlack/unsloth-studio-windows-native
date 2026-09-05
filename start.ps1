@@ -1,5 +1,4 @@
 $ErrorActionPreference = 'Stop'
-Set-StrictMode -Version Latest
 
 $Root = $PSScriptRoot
 . "$Root\scripts\env.ps1"

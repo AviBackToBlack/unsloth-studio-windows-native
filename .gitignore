@@ -6,6 +6,7 @@
 /logs/
 /forensic/
 /work/
+/.unsloth-operation.lock
 
 # Local configuration
 /config.psd1

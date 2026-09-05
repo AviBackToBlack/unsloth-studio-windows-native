@@ -116,6 +116,16 @@ if ([string]::IsNullOrWhiteSpace($ModelsRoot)) {
 
 Assert-SafeModelsRoot -InstallationRoot $Root -ModelsRoot $ModelsRoot
 
+$ManagedTopLevel = [ordered]@{
+    runtime = "$Root\runtime"
+    tools = "$Root\tools"
+    python = "$Root\python"
+    cache = "$Root\cache"
+    logs = "$Root\logs"
+    forensic = "$Root\forensic"
+    work = "$Root\work"
+}
+
 $Dirs = @(
     "$Root\runtime"
     "$Root\tools\uv"
@@ -137,10 +147,14 @@ foreach ($Dir in $Dirs) {
     [System.IO.Directory]::CreateDirectory($Dir) | Out-Null
 }
 
-# Re-run physical safety checks after directories exist. Managed Python must be
-# the real <root>\python directory and the default models directory may not be
-# a junction/alias to another managed or external location.
-Assert-ManagedChildPhysicalLocation -InstallationRoot $Root -Path "$Root\python" -RelativePath 'python'
+# Every managed top-level directory must physically remain below this root.
+# Junctions/reparse aliases to external locations defeat the containment model.
+foreach ($Relative in $ManagedTopLevel.Keys) {
+    Assert-ManagedChildPhysicalLocation `
+        -InstallationRoot $Root `
+        -Path $ManagedTopLevel[$Relative] `
+        -RelativePath $Relative
+}
 Assert-SafeModelsRoot -InstallationRoot $Root -ModelsRoot $ModelsRoot
 
 $escapedModelsRoot = $ModelsRoot.Replace("'", "''")
@@ -260,6 +274,14 @@ if ($InstallExit -ne 0) {
 }
 
 Write-Host "`n=== VALIDATE ===" -ForegroundColor Cyan
+foreach ($Relative in $ManagedTopLevel.Keys) {
+    Assert-ManagedChildPhysicalLocation `
+        -InstallationRoot $Root `
+        -Path $ManagedTopLevel[$Relative] `
+        -RelativePath $Relative
+}
+Assert-SafeModelsRoot -InstallationRoot $Root -ModelsRoot $ModelsRoot
+
 $StudioPython = "$Root\runtime\unsloth_studio\Scripts\python.exe"
 $StudioCli = "$Root\runtime\bin\unsloth.cmd"
 $LlamaServer = "$Root\runtime\llama.cpp\build\bin\Release\llama-server.exe"
@@ -300,9 +322,6 @@ if (-not $BaselineData.NVCC -and $NvccAfter) {
     throw "Unexpected global nvcc appeared during installation: $NvccAfter"
 }
 
-# Enforce the known external-footprint baseline. The uv receipt under
-# %LOCALAPPDATA%\uv is intentionally allowed and audited separately; these
-# Unsloth profile/AppData locations are not part of the contained layout.
 foreach ($Name in $KnownExternalPaths.Keys) {
     $existedBefore = [bool]$ExternalBefore[$Name]
     $existsAfter = Test-Path -LiteralPath $KnownExternalPaths[$Name]

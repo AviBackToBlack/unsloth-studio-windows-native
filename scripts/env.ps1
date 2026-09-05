@@ -2,6 +2,10 @@
 # Dot-source from start.ps1 / update.ps1 / doctor.ps1 / model-sync.ps1.
 # This file never writes persistent Windows environment variables.
 
+if (-not (Get-Command Assert-SafeModelsRoot -ErrorAction SilentlyContinue)) {
+    . "$PSScriptRoot\common.ps1"
+}
+
 $script:UnslothRoot = [System.IO.Path]::GetFullPath(
     (Split-Path -Parent $PSScriptRoot)
 )
@@ -23,6 +27,10 @@ if ([string]::IsNullOrWhiteSpace($modelsSetting)) {
     $script:UnslothModels = [System.IO.Path]::GetFullPath($modelsSetting)
 }
 
+# Runtime consumers must apply the same model-location safety policy as install
+# and uninstall before they use the configured path.
+Assert-SafeModelsRoot -InstallationRoot $script:UnslothRoot -ModelsRoot $script:UnslothModels
+
 $script:UnslothPort = if ($null -ne $script:UnslothConfig.Port) {
     [int]$script:UnslothConfig.Port
 } else {
@@ -37,6 +45,15 @@ $script:UnslothUv = Join-Path $script:UnslothRoot 'tools\uv\uv.exe'
 $script:UnslothPythonRoot = [System.IO.Path]::GetFullPath((Join-Path $script:UnslothRoot 'python')).TrimEnd('\')
 $script:UnslothPythonState = Join-Path $script:UnslothRoot 'forensic\managed-python.json'
 $script:UnslothBasePython = $null
+
+# If the managed Python directory already exists, it must physically be the
+# real <root>\python directory, not a junction/alias to another installation.
+if (Test-Path -LiteralPath $script:UnslothPythonRoot) {
+    Assert-ManagedChildPhysicalLocation `
+        -InstallationRoot $script:UnslothRoot `
+        -Path $script:UnslothPythonRoot `
+        -RelativePath 'python'
+}
 
 # uv containment must be established before any `uv python find` fallback.
 $env:UV_INSTALL_DIR = Join-Path $script:UnslothRoot 'tools\uv'
@@ -67,10 +84,19 @@ function Test-ManagedPythonCandidate {
         return $false
     }
 
-    return $full.StartsWith(
-        $script:UnslothPythonRoot + '\',
-        [System.StringComparison]::OrdinalIgnoreCase
-    )
+    try {
+        Assert-ManagedChildPhysicalLocation `
+            -InstallationRoot $script:UnslothRoot `
+            -Path $script:UnslothPythonRoot `
+            -RelativePath 'python'
+
+        return Test-PathInsideOrEqual `
+            -Path $full `
+            -Parent $script:UnslothPythonRoot `
+            -PhysicalWhenPossible
+    } catch {
+        return $false
+    }
 }
 
 if (Test-Path -LiteralPath $script:UnslothPythonState -PathType Leaf) {

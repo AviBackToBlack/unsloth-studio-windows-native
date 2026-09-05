@@ -17,8 +17,8 @@ $modelsSetting = $script:UnslothConfig.ModelsRoot
 if ([string]::IsNullOrWhiteSpace($modelsSetting)) {
     $script:UnslothModels = Join-Path $script:UnslothRoot 'models'
 } else {
-    if (-not [System.IO.Path]::IsPathRooted($modelsSetting)) {
-        throw "ModelsRoot in config.psd1 must be an absolute path: $modelsSetting"
+    if (-not [System.IO.Path]::IsPathFullyQualified($modelsSetting)) {
+        throw "ModelsRoot in config.psd1 must be a fully qualified absolute path: $modelsSetting"
     }
     $script:UnslothModels = [System.IO.Path]::GetFullPath($modelsSetting)
 }
@@ -55,6 +55,9 @@ function Test-ManagedPythonCandidate {
     }
 
     try {
+        if (-not [System.IO.Path]::IsPathFullyQualified($Candidate)) {
+            return $false
+        }
         $full = [System.IO.Path]::GetFullPath($Candidate)
     } catch {
         return $false

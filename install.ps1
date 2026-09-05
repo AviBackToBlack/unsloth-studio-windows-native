@@ -1,12 +1,15 @@
 [CmdletBinding()]
 param(
-    [string]$ModelsRoot
+    [string]$ModelsRoot,
+    [switch]$Repair
 )
 
 $ErrorActionPreference = 'Stop'
 
 $Root = [System.IO.Path]::GetFullPath($PSScriptRoot)
 $Pwsh = (Get-Process -Id $PID).Path
+
+. "$Root\scripts\common.ps1"
 
 if (-not $IsWindows) {
     throw 'This installer supports Windows only.'
@@ -20,8 +23,36 @@ if (-not [Environment]::Is64BitProcess) {
     throw 'Run the installer from 64-bit PowerShell.'
 }
 
-if (Test-Path -LiteralPath "$Root\runtime\unsloth_studio" -PathType Container) {
-    throw 'Unsloth Studio already appears to be installed. Use .\update.ps1 instead.'
+$InstallState = "$Root\forensic\install-state.json"
+$RequiredRuntime = @(
+    "$Root\runtime\unsloth_studio\Scripts\python.exe"
+    "$Root\runtime\bin\unsloth.cmd"
+    "$Root\runtime\llama.cpp\build\bin\Release\llama-server.exe"
+)
+
+$CompleteInstall = (
+    (Test-Path -LiteralPath $InstallState -PathType Leaf) -and
+    (@($RequiredRuntime | Where-Object { -not (Test-Path -LiteralPath $_ -PathType Leaf) }).Count -eq 0)
+)
+
+$PartialInstall = (
+    (Test-Path -LiteralPath "$Root\runtime" -PathType Container) -or
+    (Test-Path -LiteralPath "$Root\tools" -PathType Container) -or
+    (Test-Path -LiteralPath "$Root\python" -PathType Container)
+) -and -not $CompleteInstall
+
+if ($CompleteInstall -and -not $Repair) {
+    throw 'A complete installation already exists. Use .\update.ps1 for updates or .\install.ps1 -Repair to repair/revalidate it.'
+}
+
+if ($PartialInstall -and -not $Repair) {
+    throw 'A partial installation was detected. Re-run with .\install.ps1 -Repair to resume/rebuild managed components safely.'
+}
+
+if ($Repair) {
+    Assert-UnslothStopped -InstallationRoot $Root
+    Write-Host "`n=== REPAIR MODE ===" -ForegroundColor Yellow
+    Write-Host 'Existing managed files and Studio state will be preserved where possible.'
 }
 
 Write-Host "`n=== HOST PREREQUISITES ===" -ForegroundColor Cyan
@@ -61,13 +92,25 @@ Write-Host "NVIDIA     : $((& $Nvidia.Source --query-gpu=name,driver_version,mem
 Write-Host 'Long paths : enabled'
 Write-Host "VC++       : $($VcRuntime.Version)"
 
+$ExistingConfigPath = "$Root\config.psd1"
+$ExistingConfig = $null
+if (Test-Path -LiteralPath $ExistingConfigPath -PathType Leaf) {
+    $ExistingConfig = Import-PowerShellDataFile -LiteralPath $ExistingConfigPath
+}
+
 if ([string]::IsNullOrWhiteSpace($ModelsRoot)) {
-    $ModelsRoot = Join-Path $Root 'models'
+    if ($ExistingConfig -and -not [string]::IsNullOrWhiteSpace($ExistingConfig.ModelsRoot)) {
+        $ModelsRoot = [System.IO.Path]::GetFullPath([string]$ExistingConfig.ModelsRoot)
+    } else {
+        $ModelsRoot = Join-Path $Root 'models'
+    }
 } elseif (-not [System.IO.Path]::IsPathRooted($ModelsRoot)) {
     throw '-ModelsRoot must be an absolute path.'
 } else {
     $ModelsRoot = [System.IO.Path]::GetFullPath($ModelsRoot)
 }
+
+Assert-SafeModelsRoot -InstallationRoot $Root -ModelsRoot $ModelsRoot
 
 $Dirs = @(
     "$Root\runtime"
@@ -91,13 +134,13 @@ foreach ($Dir in $Dirs) {
 }
 
 $escapedModelsRoot = $ModelsRoot.Replace("'", "''")
+$Port = if ($ExistingConfig -and $null -ne $ExistingConfig.Port) { [int]$ExistingConfig.Port } else { 8888 }
 @"
 @{
     ModelsRoot = '$escapedModelsRoot'
-    Port = 8888
-    BindHost = '127.0.0.1'
+    Port = $Port
 }
-"@ | Set-Content -LiteralPath "$Root\config.psd1" -Encoding utf8
+"@ | Set-Content -LiteralPath $ExistingConfigPath -Encoding utf8
 
 $Stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $Baseline = "$Root\forensic\preinstall\$Stamp"
@@ -108,6 +151,7 @@ $MachinePathBefore = [Environment]::GetEnvironmentVariable('Path', 'Machine')
 
 [pscustomobject]@{
     Timestamp = (Get-Date).ToString('o')
+    Mode = if ($Repair) { 'repair' } else { 'install' }
     Root = $Root
     ModelsRoot = $ModelsRoot
     UserPath = $UserPathBefore
@@ -126,9 +170,10 @@ Write-Host "`nBaseline: $Baseline" -ForegroundColor DarkGray
 
 . "$Root\scripts\env.ps1"
 
-Write-Host "`n=== INSTALL UV ===" -ForegroundColor Cyan
+Write-Host "`n=== INSTALL / REFRESH UV ===" -ForegroundColor Cyan
 $UvInstaller = "$Root\work\uv-install.ps1"
 Invoke-WebRequest -Uri 'https://astral.sh/uv/install.ps1' -OutFile $UvInstaller -UseBasicParsing
+$UvInstallerHash = (Get-FileHash -LiteralPath $UvInstaller -Algorithm SHA256).Hash
 & $Pwsh -NoLogo -NoProfile -File $UvInstaller
 if ($LASTEXITCODE -ne 0) {
     throw "uv installer failed with exit code $LASTEXITCODE"
@@ -138,7 +183,7 @@ if (-not (Test-Path -LiteralPath $script:UnslothUv -PathType Leaf)) {
 }
 & $script:UnslothUv --version
 
-Write-Host "`n=== INSTALL PYTHON 3.13 ===" -ForegroundColor Cyan
+Write-Host "`n=== INSTALL / REFRESH PYTHON 3.13 ===" -ForegroundColor Cyan
 & $script:UnslothUv python install 3.13 --no-bin --no-config
 if ($LASTEXITCODE -ne 0) {
     throw "uv python install failed with exit code $LASTEXITCODE"
@@ -149,14 +194,25 @@ if (-not $ResolvedPython -or -not (Test-Path -LiteralPath $ResolvedPython -PathT
     throw 'Could not resolve the uv-managed Python 3.13 interpreter.'
 }
 
-$PythonRootExpected = [System.IO.Path]::GetFullPath("$Root\python")
+$PythonRootExpected = [System.IO.Path]::GetFullPath("$Root\python").TrimEnd('\')
 $PythonResolvedFull = [System.IO.Path]::GetFullPath($ResolvedPython)
-if (-not $PythonResolvedFull.StartsWith($PythonRootExpected, [System.StringComparison]::OrdinalIgnoreCase)) {
+if (-not ($PythonResolvedFull.Equals($PythonRootExpected, [System.StringComparison]::OrdinalIgnoreCase) -or
+          $PythonResolvedFull.StartsWith($PythonRootExpected + '\', [System.StringComparison]::OrdinalIgnoreCase))) {
     throw "Managed Python escaped the installation root: $PythonResolvedFull"
 }
+
+[ordered]@{
+    recorded_at = (Get-Date).ToString('o')
+    executable = $PythonResolvedFull
+    version = (& $PythonResolvedFull --version 2>&1 | Out-String).Trim()
+} | ConvertTo-Json -Depth 3 |
+    Set-Content -LiteralPath "$Root\forensic\managed-python.json" -Encoding utf8
+
+# Reload env so process-local PATH uses the actual interpreter directory.
+. "$Root\scripts\env.ps1"
 & $ResolvedPython --version
 
-Write-Host "`n=== INSTALL UNSLOTH STUDIO ===" -ForegroundColor Cyan
+Write-Host "`n=== INSTALL / REPAIR UNSLOTH STUDIO ===" -ForegroundColor Cyan
 $Installer = "$Root\work\unsloth-install.ps1"
 $InstallerMeta = "$Root\forensic\installer.json"
 $Response = Invoke-WebRequest -Uri 'https://unsloth.ai/install.ps1' -OutFile $Installer -UseBasicParsing
@@ -170,6 +226,8 @@ try { $EffectiveUrl = $Response.BaseResponse.RequestMessage.RequestUri.AbsoluteU
     effective_url = $EffectiveUrl
     sha256 = $InstallerHash
     size = (Get-Item -LiteralPath $Installer).Length
+    trust_model = 'Downloaded from the official HTTPS endpoint at execution time; recorded hashes are audit evidence, not independent authenticity verification.'
+    uv_installer_sha256 = $UvInstallerHash
 } | ConvertTo-Json -Depth 5 |
     Set-Content -LiteralPath $InstallerMeta -Encoding utf8
 
@@ -177,7 +235,7 @@ $InstallLog = "$Root\logs\install-$Stamp.log"
 & $Pwsh -NoLogo -NoProfile -File $Installer 2>&1 | Tee-Object -FilePath $InstallLog
 $InstallExit = $LASTEXITCODE
 if ($InstallExit -ne 0) {
-    throw "Official Unsloth installer failed with exit code $InstallExit. See $InstallLog"
+    throw "Official Unsloth installer failed with exit code $InstallExit. Re-run .\install.ps1 -Repair after addressing the error. See $InstallLog"
 }
 
 Write-Host "`n=== VALIDATE ===" -ForegroundColor Cyan
@@ -186,7 +244,7 @@ $StudioCli = "$Root\runtime\bin\unsloth.cmd"
 $LlamaServer = "$Root\runtime\llama.cpp\build\bin\Release\llama-server.exe"
 foreach ($Required in @($StudioPython, $StudioCli, $LlamaServer)) {
     if (-not (Test-Path -LiteralPath $Required -PathType Leaf)) {
-        throw "Required managed component is missing: $Required"
+        throw "Required managed component is missing: $Required. Re-run .\install.ps1 -Repair."
     }
 }
 
@@ -203,7 +261,7 @@ print("GPU          ", torch.cuda.get_device_name(0))
 print("Capability   ", torch.cuda.get_device_capability(0))
 '@
 if ($LASTEXITCODE -ne 0) {
-    throw 'Post-install CUDA validation failed.'
+    throw 'Post-install CUDA validation failed. Re-run .\install.ps1 -Repair after addressing the error.'
 }
 
 $UserPathAfter = [Environment]::GetEnvironmentVariable('Path', 'User')
@@ -223,12 +281,14 @@ if (-not $BaselineData.NVCC -and $NvccAfter) {
 
 [ordered]@{
     installed_at = (Get-Date).ToString('o')
+    mode = if ($Repair) { 'repair' } else { 'install' }
     root = $Root
     models_root = $ModelsRoot
+    managed_python = $PythonResolvedFull
     baseline = $Baseline
     installer_sha256 = $InstallerHash
 } | ConvertTo-Json -Depth 5 |
-    Set-Content -LiteralPath "$Root\forensic\install-state.json" -Encoding utf8
+    Set-Content -LiteralPath $InstallState -Encoding utf8
 
 Write-Host "`n=== INSTALL COMPLETE ===" -ForegroundColor Green
 Write-Host "Root   : $Root"

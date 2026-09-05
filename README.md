@@ -87,9 +87,11 @@ pwsh .\install.ps1 -ModelsRoot 'D:\AI\Models'
 2. records a small pre-install forensic baseline;
 3. installs or refreshes uv under `<root>\tools\uv`;
 4. installs managed CPython 3.13 under `<root>\python` and records the resolved interpreter path;
-5. downloads the current official Unsloth installer and records its SHA-256 for auditing;
+5. downloads the current official Unsloth installer and records its SHA-256 and effective URL for auditing;
 6. runs it with a process-local containment environment;
 7. validates CUDA, core managed components, persistent PATH and build-tool leakage.
+
+A recorded or dynamically resolved base Python is accepted only when the executable is actually contained under the **current** `<root>\python` directory. This keeps copied or moved installations from silently reusing another installation's interpreter.
 
 ### Repair a partial installation
 
@@ -99,7 +101,7 @@ If an install is interrupted after managed files have already been created, reru
 pwsh .\install.ps1 -Repair
 ```
 
-Repair mode preserves existing managed files and Studio state where possible, refreshes uv/Python, reruns the current official Unsloth installer, and repeats validation. It does not require manually guessing which partial directories to delete.
+Repair mode preserves existing managed files and Studio state where possible, refreshes uv/Python, reruns the current official Unsloth installer, and repeats validation. It does not require manually guessing which partial directories to delete. Existing configuration is held to the same absolute-path and model-root safety rules as a fresh install.
 
 ## Start
 
@@ -127,7 +129,7 @@ Stop Studio first, then:
 pwsh .\update.ps1
 ```
 
-The updater detects managed processes belonging to this installation rather than treating any listener on the configured port as Studio.
+The updater detects managed processes belonging to this installation rather than treating any listener on the configured port as Studio. Process enumeration is fail-closed: if Windows CIM/WMI cannot establish process ownership, mutating maintenance aborts instead of assuming Studio is stopped.
 
 It uses the official:
 
@@ -135,7 +137,7 @@ It uses the official:
 unsloth studio update
 ```
 
-Before updating it requires and backs up `studio.db` and `auth.db`. Afterward it validates CUDA, requires both databases to pass `PRAGMA integrity_check`, verifies persistent PATH, and checks for unexpected CMake/`nvcc` appearance.
+Before updating it requires `studio.db` and `auth.db` and creates **WAL-aware SQLite snapshots using SQLite's backup API**. This captures committed transactions that may still be present in WAL files after a crash; it does not rely on raw `.db` file copies. Afterward it validates required Python packages, CUDA, database integrity, persistent PATH, and unexpected CMake/`nvcc` appearance.
 
 ## Health check
 
@@ -145,7 +147,7 @@ pwsh .\doctor.ps1
 
 The doctor reports:
 
-- Unsloth / PyTorch versions
+- required Unsloth / PyTorch package status and versions
 - CUDA device and capability
 - Studio/auth database integrity
 - saved Hugging Face credential status
@@ -156,9 +158,9 @@ The doctor reports:
 - persistent PATH isolation
 - TorchInductor cache location
 - external footprint
-- Studio health endpoint
+- Studio health endpoint and process ownership
 
-It exits with a non-zero status when a core health check fails, including a missing, unreadable, or corrupt Studio/auth database after Studio has been initialized.
+It exits with a non-zero status when a core health check fails, including missing required packages, missing/unreadable/corrupt Studio state, failed process enumeration, or a health response on the configured port that cannot be associated with this installation's managed runtime.
 
 ## Hugging Face model sync
 
@@ -197,7 +199,7 @@ The Hugging Face `local_dir` metadata remains alongside the model; the script do
 pwsh .\uninstall.ps1
 ```
 
-The script refuses to run while processes from this installation's `runtime` are active. Before deleting anything it also revalidates that `ModelsRoot` does not overlap managed directories.
+The script refuses to run while processes from this installation's `runtime` are active. If process ownership cannot be established through CIM/WMI, uninstall fails closed. Before deleting anything it also revalidates that `ModelsRoot` does not overlap managed directories.
 
 It removes managed installation data but preserves:
 

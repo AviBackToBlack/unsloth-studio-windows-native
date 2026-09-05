@@ -3,7 +3,7 @@
     # <repository root>\models
     ModelsRoot = 'D:\AI\Models'
 
-    # Unsloth Studio listener used by start.ps1.
+    # Primary local Studio listener. start.ps1 always binds to 127.0.0.1.
+    # Use Studio's own Remote & LAN settings if network access is needed.
     Port = 8888
-    BindHost = '127.0.0.1'
 }

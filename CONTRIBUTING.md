@@ -13,6 +13,7 @@ Keep changes focused on the native-Windows managed-runtime scripts and their doc
 - Preserve process-local environment isolation.
 - Do not commit runtime state, models, caches, databases, tokens, or other credentials.
 - Explain any change to CUDA/backend/update/model-sync safety behavior in the PR body.
+- Resolve review conversations and ensure required CI/security checks are green before merge.
 
 GPU/runtime acceptance requires a trusted Windows machine with the managed installation and is intentionally separate from public PR CI.
 
